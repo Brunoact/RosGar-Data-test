@@ -149,14 +149,13 @@ def find_worker_databases() -> List[Tuple[int, str]]:
     """Busca todas las bases de datos de workers disponibles."""
     found = []
     
-    # Buscar en directorio actual
     for worker_id in range(TOTAL_WORKERS):
         db_name = f'{WORKER_DB_PREFIX}{worker_id}.db'
         if os.path.exists(db_name):
             found.append((worker_id, db_name))
             continue
         
-        # Buscar en subdirectorios (por si acaso)
+        # Buscar en subdirectorios
         pattern = f'**/{db_name}'
         matches = glob.glob(pattern, recursive=True)
         if matches:
@@ -739,8 +738,51 @@ async def save_worker_results(results: List[Dict], dolar_mep: float):
         fatal_error(f"Error guardando resultados del worker {WORKER_ID}", e)
 
 # ═══════════════════════════════════════════════════════════════
-# 🔄 CONSOLIDACIÓN DE WORKERS
+# 🔄 CONSOLIDACIÓN DE WORKERS - VERSIÓN CORREGIDA
 # ═══════════════════════════════════════════════════════════════
+def read_worker_data(db_path: str) -> Tuple[List[tuple], Dict[str, str]]:
+    """
+    Lee todos los datos de un worker y los devuelve.
+    Usa conexión separada que se cierra al terminar.
+    """
+    vehicles = []
+    metadata = {}
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        
+        # Verificar integridad
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != 'ok':
+            logger.error(f"   ❌ BD corrupta: {integrity}")
+            conn.close()
+            return [], {}
+        
+        # Leer metadata
+        for row in conn.execute("SELECT key, value FROM scrape_metadata"):
+            metadata[row['key']] = row['value']
+        
+        # Leer vehículos
+        cursor = conn.execute("""
+            SELECT id, url, marca, modelo, version, año, kilometros,
+                   transmision, combustible, vendedor, agencia, imagen,
+                   precio_ars, precio_usd
+            FROM vehicles
+        """)
+        
+        for row in cursor:
+            vehicles.append(tuple(row))
+        
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"   ❌ Error leyendo {db_path}: {e}")
+        return [], {}
+    
+    return vehicles, metadata
+
+
 def consolidate_worker_results():
     """Consolida los resultados de todos los workers."""
     logger.info("=" * 60)
@@ -750,7 +792,7 @@ def consolidate_worker_results():
     try:
         today = date.today().isoformat()
         
-        # Buscar todos los workers disponibles
+        # Buscar workers disponibles
         available_workers = find_worker_databases()
         
         logger.info(f"\n📂 Buscando bases de datos de workers...")
@@ -759,7 +801,6 @@ def consolidate_worker_results():
             logger.info(f"   ✅ Worker {worker_id}: {db_path} ({size:,} bytes)")
         
         if not available_workers:
-            # Listar archivos para debug
             logger.error("❌ No se encontraron bases de datos de workers")
             logger.error("Archivos en directorio actual:")
             for f in os.listdir('.'):
@@ -768,59 +809,61 @@ def consolidate_worker_results():
         
         logger.info(f"\n📊 Workers encontrados: {len(available_workers)}/{TOTAL_WORKERS}")
         
-        if len(available_workers) < TOTAL_WORKERS * 0.5:
-            logger.warning(f"⚠️ Solo {len(available_workers)}/{TOTAL_WORKERS} workers (<50%)")
+        # ═══════════════════════════════════════════════════════════
+        # PASO 1: Leer todos los datos de los workers en memoria
+        # ═══════════════════════════════════════════════════════════
+        logger.info("\n📖 Leyendo datos de todos los workers...")
         
-        # Inicializar BD maestra
-        master_exists = os.path.exists(MASTER_DB)
-        if master_exists:
-            logger.info(f"📂 BD maestra existente encontrada")
-        else:
-            logger.info(f"📂 Creando nueva BD maestra...")
-        
-        init_master_db(MASTER_DB)
-        conn = sqlite3.connect(MASTER_DB)
-        conn.execute("PRAGMA foreign_keys = ON")
-        cursor = conn.cursor()
-        
-        # Obtener dólar del primer worker disponible
+        all_worker_data = []  # Lista de (worker_id, vehicles, metadata)
         dolar_mep = None
         total_rate_limits = 0
         
         for worker_id, db_path in available_workers:
-            try:
-                worker_conn = sqlite3.connect(db_path)
+            logger.info(f"   📥 Leyendo Worker {worker_id}...")
+            
+            vehicles, metadata = read_worker_data(db_path)
+            
+            if vehicles:
+                all_worker_data.append((worker_id, vehicles, metadata))
+                logger.info(f"      ✅ {len(vehicles)} vehículos leídos")
                 
-                # Verificar integridad
-                integrity = worker_conn.execute("PRAGMA integrity_check").fetchone()[0]
-                if integrity != 'ok':
-                    logger.error(f"❌ Worker {worker_id}: BD corrupta")
-                    worker_conn.close()
-                    continue
+                # Obtener dólar del primer worker que lo tenga
+                if not dolar_mep and 'dolar_mep' in metadata:
+                    dolar_mep = float(metadata['dolar_mep'])
                 
-                result = worker_conn.execute(
-                    "SELECT value FROM scrape_metadata WHERE key = 'dolar_mep'"
-                ).fetchone()
-                if result and not dolar_mep:
-                    dolar_mep = float(result[0])
-                
-                rl = worker_conn.execute(
-                    "SELECT value FROM scrape_metadata WHERE key = 'rate_limits_429'"
-                ).fetchone()
-                if rl:
-                    total_rate_limits += int(rl[0])
-                
-                worker_conn.close()
-            except Exception as e:
-                logger.error(f"Error leyendo worker {worker_id}: {e}")
+                # Sumar rate limits
+                if 'rate_limits_429' in metadata:
+                    total_rate_limits += int(metadata['rate_limits_429'])
+            else:
+                logger.warning(f"      ⚠️ Sin datos o error")
+        
+        if not all_worker_data:
+            fatal_error("No se pudo leer datos de ningún worker")
         
         if not dolar_mep:
-            conn.close()
             fatal_error("No se encontró cotización del dólar en ningún worker")
         
-        logger.info(f"\n💵 Dólar MEP: ${dolar_mep:.2f}")
+        total_vehicles_read = sum(len(data[1]) for data in all_worker_data)
+        logger.info(f"\n📊 Total vehículos leídos de workers: {total_vehicles_read}")
+        logger.info(f"💵 Dólar MEP: ${dolar_mep:.2f}")
+        
         if total_rate_limits > 0:
             logger.info(f"⚠️ Rate limits totales: {total_rate_limits}")
+        
+        # ═══════════════════════════════════════════════════════════
+        # PASO 2: Inicializar/abrir BD maestra
+        # ═══════════════════════════════════════════════════════════
+        master_exists = os.path.exists(MASTER_DB)
+        if master_exists:
+            logger.info(f"\n📂 BD maestra existente encontrada")
+        else:
+            logger.info(f"\n📂 Creando nueva BD maestra...")
+        
+        init_master_db(MASTER_DB)
+        
+        conn = sqlite3.connect(MASTER_DB)
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
         
         # Guardar metadatos
         cursor.execute(
@@ -837,113 +880,89 @@ def consolidate_worker_results():
         )
         cursor.execute(
             "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
-            ('workers_consolidated', str(len(available_workers)))
+            ('workers_consolidated', str(len(all_worker_data)))
         )
         
+        # ═══════════════════════════════════════════════════════════
+        # PASO 3: Insertar/actualizar vehículos en BD maestra
+        # ═══════════════════════════════════════════════════════════
+        logger.info("\n💾 Insertando datos en BD maestra...")
+        
         seen_ids_today = set()
-        total_from_workers = 0
         
-        # Procesar cada worker
-        for worker_id, db_path in available_workers:
-            logger.info(f"\n📥 Procesando Worker {worker_id} ({db_path})...")
+        for worker_id, vehicles, metadata in all_worker_data:
+            logger.info(f"   📝 Procesando {len(vehicles)} vehículos del Worker {worker_id}...")
             
-            try:
-                cursor.execute(f"ATTACH DATABASE '{db_path}' AS worker")
+            for v in vehicles:
+                # v = (id, url, marca, modelo, version, año, km, trans, comb, vend, agen, img, ars, usd)
+                vehicle_id = v[0]
+                seen_ids_today.add(vehicle_id)
                 
-                count = cursor.execute("SELECT COUNT(*) FROM worker.vehicles").fetchone()[0]
-                total_from_workers += count
-                logger.info(f"   Vehículos: {count}")
+                new_precio_usd = v[13]
                 
-                if count == 0:
-                    cursor.execute("DETACH DATABASE worker")
-                    continue
+                # Verificar si existe
+                existing = cursor.execute(
+                    "SELECT precio_usd, primera_vista FROM vehicles WHERE id = ?",
+                    (vehicle_id,)
+                ).fetchone()
                 
-                worker_vehicles = cursor.execute("""
-                    SELECT id, url, marca, modelo, version, año, kilometros,
-                           transmision, combustible, vendedor, agencia, imagen,
-                           precio_ars, precio_usd
-                    FROM worker.vehicles
-                """).fetchall()
-                
-                for v in worker_vehicles:
-                    vehicle_id = v[0]
-                    seen_ids_today.add(vehicle_id)
+                if existing:
+                    old_precio_usd = existing[0]
                     
-                    existing = cursor.execute(
-                        "SELECT precio_usd, primera_vista FROM vehicles WHERE id = ?",
-                        (vehicle_id,)
-                    ).fetchone()
+                    cursor.execute("""
+                        UPDATE vehicles SET
+                            url = ?, marca = ?, modelo = ?, version = ?, año = ?,
+                            kilometros = ?, transmision = ?, combustible = ?,
+                            vendedor = ?, agencia = ?, imagen = ?, precio_ars = ?,
+                            precio_usd = ?, ultima_vista = ?, activo = 1,
+                            dias_publicado = julianday(?) - julianday(primera_vista)
+                        WHERE id = ?
+                    """, (
+                        v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
+                        v[9], v[10], v[11], v[12], v[13], today, today, vehicle_id
+                    ))
+                    STATS.vehicles_updated += 1
                     
-                    new_precio_usd = v[13]
-                    
-                    if existing:
-                        old_precio_usd = existing[0]
-                        
+                    # Registrar cambio de precio
+                    if old_precio_usd and new_precio_usd and abs(old_precio_usd - new_precio_usd) > 0.01:
+                        variacion = ((new_precio_usd - old_precio_usd) / old_precio_usd) * 100
                         cursor.execute("""
-                            UPDATE vehicles SET
-                                url = ?, marca = ?, modelo = ?, version = ?, año = ?,
-                                kilometros = ?, transmision = ?, combustible = ?,
-                                vendedor = ?, agencia = ?, imagen = ?, precio_ars = ?,
-                                precio_usd = ?, ultima_vista = ?, activo = 1,
-                                dias_publicado = julianday(?) - julianday(primera_vista)
-                            WHERE id = ?
-                        """, (
-                            v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-                            v[9], v[10], v[11], v[12], v[13], today, today, vehicle_id
-                        ))
-                        STATS.vehicles_updated += 1
-                        
-                        if old_precio_usd and new_precio_usd and abs(old_precio_usd - new_precio_usd) > 0.01:
-                            variacion = ((new_precio_usd - old_precio_usd) / old_precio_usd) * 100
-                            cursor.execute("""
-                                INSERT INTO price_history
-                                (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
-                                VALUES (?, ?, ?, ?, ?)
-                            """, (vehicle_id, v[12], new_precio_usd, today, round(variacion, 2)))
-                            STATS.vehicles_price_changed += 1
-                    else:
+                            INSERT INTO price_history
+                            (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (vehicle_id, v[12], new_precio_usd, today, round(variacion, 2)))
+                        STATS.vehicles_price_changed += 1
+                else:
+                    # Nuevo vehículo
+                    cursor.execute("""
+                        INSERT INTO vehicles (
+                            id, url, marca, modelo, version, año, kilometros,
+                            transmision, combustible, vendedor, agencia, imagen,
+                            precio_ars, precio_usd, primera_vista, ultima_vista,
+                            activo, dias_publicado
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+                    """, (
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                        v[8], v[9], v[10], v[11], v[12], v[13], today, today
+                    ))
+                    
+                    # Precio inicial
+                    if new_precio_usd:
                         cursor.execute("""
-                            INSERT INTO vehicles (
-                                id, url, marca, modelo, version, año, kilometros,
-                                transmision, combustible, vendedor, agencia, imagen,
-                                precio_ars, precio_usd, primera_vista, ultima_vista,
-                                activo, dias_publicado
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
-                        """, (
-                            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                            v[8], v[9], v[10], v[11], v[12], v[13], today, today
-                        ))
-                        
-                        if new_precio_usd:
-                            cursor.execute("""
-                                INSERT INTO price_history
-                                (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
-                                VALUES (?, ?, ?, ?, NULL)
-                            """, (vehicle_id, v[12], new_precio_usd, today))
-                        
-                        STATS.vehicles_new += 1
-                
-                cursor.execute("DETACH DATABASE worker")
-                logger.info(f"   ✅ Procesado correctamente")
-                
-            except Exception as e:
-                logger.error(f"❌ Error en worker {worker_id}: {e}")
-                if DEBUG_MODE:
-                    import traceback
-                    traceback.print_exc()
-                try:
-                    cursor.execute("DETACH DATABASE worker")
-                except:
-                    pass
+                            INSERT INTO price_history
+                            (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
+                            VALUES (?, ?, ?, ?, NULL)
+                        """, (vehicle_id, v[12], new_precio_usd, today))
+                    
+                    STATS.vehicles_new += 1
+            
+            logger.info(f"      ✅ Completado")
         
-        logger.info(f"\n📊 Total vehículos de workers: {total_from_workers}")
-        logger.info(f"   IDs únicos vistos hoy: {len(seen_ids_today)}")
+        logger.info(f"\n📊 IDs únicos procesados: {len(seen_ids_today)}")
         
-        if not seen_ids_today:
-            conn.close()
-            fatal_error("No se procesó ningún vehículo")
-        
-        # Marcar inactivos
+        # ═══════════════════════════════════════════════════════════
+        # PASO 4: Marcar inactivos y limpiar
+        # ═══════════════════════════════════════════════════════════
         newly_inactive = 0
         if seen_ids_today:
             placeholders = ','.join('?' * len(seen_ids_today))
@@ -954,7 +973,7 @@ def consolidate_worker_results():
             newly_inactive = result.rowcount
             logger.info(f"   🔴 Marcados inactivos: {newly_inactive}")
         
-        # Purgar antiguos
+        # Purgar antiguos (>90 días)
         cursor.execute("""
             DELETE FROM price_history WHERE vehicle_id IN (
                 SELECT id FROM vehicles
@@ -978,20 +997,24 @@ def consolidate_worker_results():
         conn.commit()
         conn.close()
         
-        # Eliminar DBs de workers
+        # ═══════════════════════════════════════════════════════════
+        # PASO 5: Eliminar DBs de workers
+        # ═══════════════════════════════════════════════════════════
+        logger.info("\n🗑️ Limpiando archivos temporales...")
         for worker_id, db_path in available_workers:
             try:
                 os.remove(db_path)
-                logger.info(f"   🗑️ Eliminado {db_path}")
-            except:
-                pass
+                logger.info(f"   Eliminado {db_path}")
+            except Exception as e:
+                logger.warning(f"   No se pudo eliminar {db_path}: {e}")
         
         db_size = os.path.getsize(MASTER_DB) / 1024 / 1024
         
         logger.info("\n" + "=" * 60)
         logger.info("✅ CONSOLIDACIÓN COMPLETADA")
         logger.info("=" * 60)
-        logger.info(f"   👷 Workers procesados: {len(available_workers)}/{TOTAL_WORKERS}")
+        logger.info(f"   👷 Workers procesados: {len(all_worker_data)}/{TOTAL_WORKERS}")
+        logger.info(f"   📥 Vehículos leídos: {total_vehicles_read}")
         logger.info(f"   🆕 Nuevos: {STATS.vehicles_new}")
         logger.info(f"   🔄 Actualizados: {STATS.vehicles_updated}")
         logger.info(f"   💰 Cambios precio: {STATS.vehicles_price_changed}")
