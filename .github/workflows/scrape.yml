@@ -1,4 +1,4 @@
-name: 🚗 Scraping RosarioGarage
+name: 🚗 RosarioGarage Scraper
 
 on:
   schedule:
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     
     strategy:
-      fail-fast: true  # Si un worker falla, cancelar todos
+      fail-fast: false  # No cancelar todos si uno falla
       max-parallel: 8
       matrix:
         worker_id: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -44,7 +44,7 @@ jobs:
       - name: 📦 Instalar dependencias
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install httpx[http2] beautifulsoup4 lxml aiosqlite
 
       - name: 🚀 Ejecutar Worker ${{ matrix.worker_id }}
         env:
@@ -57,8 +57,13 @@ jobs:
       - name: 📊 Info de la BD del worker
         if: success()
         run: |
-          ls -lh rosariogarage_worker_${{ matrix.worker_id }}.db
-          echo "Tamaño: $(du -h rosariogarage_worker_${{ matrix.worker_id }}.db | cut -f1)"
+          if [ -f rosariogarage_worker_${{ matrix.worker_id }}.db ]; then
+            ls -lh rosariogarage_worker_${{ matrix.worker_id }}.db
+            echo "Tamaño: $(du -h rosariogarage_worker_${{ matrix.worker_id }}.db | cut -f1)"
+            sqlite3 rosariogarage_worker_${{ matrix.worker_id }}.db "SELECT COUNT(*) as total FROM vehicles;" | xargs -I {} echo "Vehículos en worker ${{ matrix.worker_id }}: {}"
+          else
+            echo "⚠️ No se generó archivo de base de datos"
+          fi
 
       - name: 📤 Subir BD parcial como artifact
         if: success()
@@ -77,6 +82,7 @@ jobs:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
     needs: scrape
+    if: always() && contains(needs.scrape.result, 'success')  # Solo si al menos un worker tuvo éxito
     
     steps:
       - name: 📥 Checkout código
@@ -88,21 +94,22 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: 📦 Instalar dependencias
-        run: pip install aiosqlite
+        run: |
+          pip install --upgrade pip
+          pip install httpx beautifulsoup4 lxml aiosqlite
 
       - name: 📥 Descargar BD maestra anterior (si existe)
-        uses: dawidd6/action-download-artifact@v3
+        uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: rosariogarage-db
-          workflow: scrape.yml
-          workflow_conclusion: success
-          if_no_artifact_found: ignore
+          name: rosariogarage-master-db
+          path: .
 
       - name: 📥 Descargar todas las BDs de workers
         uses: actions/download-artifact@v4
         with:
           pattern: worker-*-db
+          path: .
           merge-multiple: true
 
       - name: 📋 Verificar archivos descargados
@@ -110,8 +117,14 @@ jobs:
           echo "=== Archivos .db encontrados ==="
           ls -lh *.db 2>/dev/null || echo "⚠️ No se encontraron archivos .db"
           echo ""
-          echo "=== Total archivos ==="
-          ls -la
+          echo "=== Verificación de workers ==="
+          for i in {0..7}; do
+            if [ -f "rosariogarage_worker_${i}.db" ]; then
+              echo "✅ Worker ${i}: $(du -h rosariogarage_worker_${i}.db | cut -f1)"
+            else
+              echo "⚠️ Worker ${i}: No encontrado"
+            fi
+          done
 
       - name: 🔄 Consolidar todas las BDs
         env:
@@ -120,124 +133,244 @@ jobs:
         run: python scraper_rosariogarage.py
         timeout-minutes: 10
 
-      - name: 📊 Generar estadísticas
+      - name: 📊 Generar estadísticas detalladas
+        if: success()
         run: |
           python3 << 'PYTHON_SCRIPT'
           import sqlite3
-          from datetime import date
+          from datetime import date, datetime
+          import json
           
-          conn = sqlite3.connect('rosariogarage.db')
+          def format_number(n):
+              return f"{n:,}".replace(",", ".")
           
-          print("=" * 60)
-          print("📊 RESUMEN DEL SCRAPING")
-          print("=" * 60)
-          print(f"📅 Fecha: {date.today()}")
-          print()
-          
-          # Vehículos
-          total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
-          activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
-          inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
-          
-          print(f"🚗 VEHÍCULOS")
-          print(f"   Total en BD:     {total:,}")
-          print(f"   ├─ Activos:      {activos:,}")
-          print(f"   └─ Inactivos:    {inactivos:,}")
-          print()
-          
-          # Nuevos y cambios hoy
-          today = date.today().isoformat()
-          nuevos_hoy = conn.execute(
-              "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
-          ).fetchone()[0]
-          
-          cambios_precio_hoy = conn.execute(
-              "SELECT COUNT(*) FROM price_history WHERE fecha = ?", (today,)
-          ).fetchone()[0]
-          
-          inactivos_hoy = conn.execute(
-              "SELECT COUNT(*) FROM vehicles WHERE activo = 0 AND ultima_vista = date('now', '-1 day')"
-          ).fetchone()[0]
-          
-          print(f"📈 CAMBIOS HOY")
-          print(f"   Nuevos:          {nuevos_hoy:,}")
-          print(f"   Cambios precio:  {cambios_precio_hoy:,}")
-          print(f"   Vendidos/Inact:  {inactivos_hoy:,}")
-          print()
-          
-          # Top marcas
-          print(f"🏭 TOP 10 MARCAS (Activos)")
-          for marca, count in conn.execute("""
-              SELECT marca, COUNT(*) as c 
-              FROM vehicles 
-              WHERE activo = 1 AND marca IS NOT NULL
-              GROUP BY marca 
-              ORDER BY c DESC 
-              LIMIT 10
-          """):
-              print(f"   {marca:15s} {count:4,}")
-          print()
-          
-          # Historial total
-          total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
-          print(f"📜 Registros de historial: {total_history:,}")
-          
-          # Metadata
-          dolar = conn.execute(
-              "SELECT value FROM scrape_metadata WHERE key = 'last_dolar_mep'"
-          ).fetchone()
-          if dolar:
-              print(f"💵 Dólar MEP usado: ${float(dolar[0]):.2f}")
-          
-          rate_limits = conn.execute(
-              "SELECT value FROM scrape_metadata WHERE key = 'rate_limits_429'"
-          ).fetchone()
-          if rate_limits and int(rate_limits[0]) > 0:
-              print(f"⚠️ Rate limits detectados: {rate_limits[0]}")
-          
-          print("=" * 60)
-          
-          conn.close()
+          try:
+              conn = sqlite3.connect('rosariogarage.db')
+              
+              print("=" * 60)
+              print("📊 RESUMEN DEL SCRAPING - ROSARIOGARAGE")
+              print("=" * 60)
+              print(f"📅 Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+              print()
+              
+              # Vehículos
+              total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+              activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
+              inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
+              
+              print(f"🚗 VEHÍCULOS")
+              print(f"   Total en BD:     {format_number(total)}")
+              print(f"   ├─ Activos:      {format_number(activos)}")
+              print(f"   └─ Inactivos:    {format_number(inactivos)}")
+              print()
+              
+              # Nuevos y cambios hoy
+              today = date.today().isoformat()
+              nuevos_hoy = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
+              ).fetchone()[0]
+              
+              cambios_precio_hoy = conn.execute(
+                  "SELECT COUNT(*) FROM price_history WHERE fecha = ?", (today,)
+              ).fetchone()[0]
+              
+              actualizados_hoy = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE ultima_vista = ? AND primera_vista != ?", 
+                  (today, today)
+              ).fetchone()[0]
+              
+              inactivos_hoy = conn.execute(
+                  """SELECT COUNT(*) FROM vehicles 
+                     WHERE activo = 0 
+                     AND ultima_vista < date('now')
+                     AND ultima_vista >= date('now', '-2 days')"""
+              ).fetchone()[0]
+              
+              print(f"📈 CAMBIOS HOY")
+              print(f"   Nuevos:          {format_number(nuevos_hoy)}")
+              print(f"   Actualizados:    {format_number(actualizados_hoy)}")
+              print(f"   Cambios precio:  {format_number(cambios_precio_hoy)}")
+              print(f"   Vendidos/Inact:  {format_number(inactivos_hoy)}")
+              print()
+              
+              # Rango de precios (activos)
+              precio_stats = conn.execute("""
+                  SELECT 
+                      MIN(precio_usd) as min_precio,
+                      MAX(precio_usd) as max_precio,
+                      AVG(precio_usd) as avg_precio,
+                      COUNT(*) as count
+                  FROM vehicles 
+                  WHERE activo = 1 
+                  AND precio_usd IS NOT NULL 
+                  AND precio_usd > 0
+              """).fetchone()
+              
+              if precio_stats[3] > 0:
+                  print(f"💰 RANGO DE PRECIOS (USD)")
+                  print(f"   Mínimo:          ${format_number(int(precio_stats[0]))}")
+                  print(f"   Máximo:          ${format_number(int(precio_stats[1]))}")
+                  print(f"   Promedio:        ${format_number(int(precio_stats[2]))}")
+                  print()
+              
+              # Top marcas
+              print(f"🏭 TOP 10 MARCAS (Activos)")
+              for marca, count in conn.execute("""
+                  SELECT marca, COUNT(*) as c 
+                  FROM vehicles 
+                  WHERE activo = 1 AND marca IS NOT NULL AND marca != 'N/A'
+                  GROUP BY marca 
+                  ORDER BY c DESC 
+                  LIMIT 10
+              """):
+                  bar = '█' * min(30, int(count * 30 / activos))
+                  print(f"   {marca:15s} {count:5} {bar}")
+              print()
+              
+              # Top modelos más ofrecidos
+              print(f"🚙 TOP 5 MODELOS MÁS OFRECIDOS")
+              for modelo, marca, count in conn.execute("""
+                  SELECT modelo, marca, COUNT(*) as c 
+                  FROM vehicles 
+                  WHERE activo = 1 
+                  AND modelo IS NOT NULL 
+                  AND modelo != 'N/A'
+                  AND marca IS NOT NULL
+                  AND marca != 'N/A'
+                  GROUP BY marca, modelo 
+                  ORDER BY c DESC 
+                  LIMIT 5
+              """):
+                  print(f"   {marca} {modelo[:30]:30s} {count:4}")
+              print()
+              
+              # Metadata
+              metadata = {}
+              for key, value in conn.execute("SELECT key, value FROM scrape_metadata"):
+                  metadata[key] = value
+              
+              if 'last_dolar_mep' in metadata:
+                  print(f"💵 Dólar MEP: ${float(metadata['last_dolar_mep']):.2f}")
+              
+              if 'rate_limits_429' in metadata and int(metadata.get('rate_limits_429', 0)) > 0:
+                  print(f"⚠️ Rate limits detectados: {metadata['rate_limits_429']}")
+              
+              # Historial total
+              total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+              print(f"📜 Registros de historial: {format_number(total_history)}")
+              
+              # Estadísticas de días publicado
+              avg_dias = conn.execute("""
+                  SELECT AVG(dias_publicado) 
+                  FROM vehicles 
+                  WHERE activo = 1 AND dias_publicado > 0
+              """).fetchone()[0]
+              
+              if avg_dias:
+                  print(f"📅 Promedio días publicado: {int(avg_dias)} días")
+              
+              print("=" * 60)
+              
+              # Generar JSON para GitHub Summary
+              summary_data = {
+                  "total": total,
+                  "activos": activos,
+                  "nuevos_hoy": nuevos_hoy,
+                  "cambios_precio": cambios_precio_hoy,
+                  "dolar_mep": float(metadata.get('last_dolar_mep', 0))
+              }
+              
+              with open("summary.json", "w") as f:
+                  json.dump(summary_data, f)
+              
+              conn.close()
+              
+          except Exception as e:
+              print(f"❌ Error generando estadísticas: {e}")
+              import traceback
+              traceback.print_exc()
           PYTHON_SCRIPT
 
-      - name: 📊 Tamaño final de la BD
+      - name: 📊 Análisis de tamaño y optimización
         run: |
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
           SIZE_HR=$(du -h rosariogarage.db | cut -f1)
-          echo "💾 Tamaño: $SIZE_HR ($SIZE_MB MB)"
+          
+          echo "💾 Tamaño de la base de datos: $SIZE_HR"
           
           if [ $SIZE_MB -gt 100 ]; then
-            echo "⚠️ ADVERTENCIA: La BD supera 100 MB. Considera habilitar Git LFS."
+            echo "⚠️ ADVERTENCIA: La BD supera 100 MB"
+            echo "   Ejecutando VACUUM para optimizar..."
+            sqlite3 rosariogarage.db "VACUUM;"
+            NEW_SIZE=$(du -h rosariogarage.db | cut -f1)
+            echo "   Nuevo tamaño: $NEW_SIZE"
           fi
 
       - name: 📤 Subir BD consolidada
         uses: actions/upload-artifact@v4
         with:
-          name: rosariogarage-db
+          name: rosariogarage-master-db
           path: rosariogarage.db
           retention-days: 90
-          compression-level: 6
+          compression-level: 9
           if-no-files-found: error
 
       - name: 📝 Crear resumen del workflow
+        if: success()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ## ✅ Scraping Completado
+          if [ -f summary.json ]; then
+            NUEVOS=$(jq -r '.nuevos_hoy' summary.json)
+            ACTIVOS=$(jq -r '.activos' summary.json)
+            CAMBIOS=$(jq -r '.cambios_precio' summary.json)
+            DOLAR=$(jq -r '.dolar_mep' summary.json)
+          else
+            NUEVOS="N/A"
+            ACTIVOS="N/A"
+            CAMBIOS="N/A"
+            DOLAR="N/A"
+          fi
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # ✅ Scraping RosarioGarage Completado
           
           **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
           
-          ### 📊 Estadísticas
+          ## 📊 Resumen
           
-          Ver los logs del paso "Generar estadísticas" para detalles completos.
+          | Métrica | Valor |
+          |---------|-------|
+          | 🚗 Vehículos activos | **${ACTIVOS}** |
+          | 🆕 Nuevos hoy | **${NUEVOS}** |
+          | 💰 Cambios de precio | **${CAMBIOS}** |
+          | 💵 Dólar MEP | **\$${DOLAR}** |
           
-          ### 📥 Archivos Generados
+          ## 📥 Descarga
           
-          - `rosariogarage.db` - Base de datos consolidada (disponible en Artifacts por 90 días)
+          La base de datos completa está disponible en los **Artifacts** del workflow (retención: 90 días)
           
+          ---
+          
+          *Ver logs del paso "Generar estadísticas detalladas" para más información*
           EOF
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 3: Notificación en caso de error
+  # JOB 3: Limpieza de artifacts antiguos (opcional)
+  # ══════════════════════════════════════════════════════════════
+  cleanup:
+    name: 🧹 Limpieza
+    runs-on: ubuntu-latest
+    needs: consolidate
+    if: always()
+    
+    steps:
+      - name: 🗑️ Eliminar artifacts de workers
+        uses: geekyeggo/delete-artifact@v4
+        with:
+          name: worker-*-db
+          failOnError: false
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 4: Notificación en caso de error
   # ══════════════════════════════════════════════════════════════
   notify-failure:
     name: 🚨 Notificar Fallo
@@ -246,8 +379,23 @@ jobs:
     if: failure()
     
     steps:
-      - name: 📝 Registrar fallo
+      - name: 📝 Registrar fallo en summary
         run: |
-          echo "❌ El scraping falló. Se reintentará mañana."
-          echo "Revisa los logs de los workers para más detalles."
-          exit 0  # No fallar este job
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # ❌ Scraping Fallido
+          
+          **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
+          
+          El proceso de scraping ha fallado. Se reintentará automáticamente mañana.
+          
+          ## 🔍 Pasos para diagnosticar:
+          
+          1. Revisar los logs de los workers que fallaron
+          2. Verificar si hubo cambios en el sitio web
+          3. Comprobar límites de rate limiting
+          4. Validar conectividad de red
+          
+          ---
+          
+          *El workflow se ejecutará nuevamente según el schedule programado*
+          EOF
