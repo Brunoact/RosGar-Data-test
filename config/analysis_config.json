@@ -1,0 +1,39 @@
+{
+  "filtering": {
+    "min_price_usd": 1000,
+    "max_price_usd": 500000,
+    "min_year": 1930,
+    "max_year": 2025,
+    "min_samples_for_stats": 3,
+    "exclude_zero_km": false
+  },
+  "statistics": {
+    "spread_threshold_high": 15,
+    "volume_threshold_high": 10,
+    "anomaly_threshold_percent": 15,
+    "outlier_iqr_multiplier": 1.5
+  },
+  "scoring": {
+    "weight_price_discount": 0.35,
+    "weight_days_published": 0.20,
+    "weight_price_drops": 0.20,
+    "weight_seller_type": 0.10,
+    "weight_model_liquidity": 0.15
+  },
+  "pricing": {
+    "first_offer_discount": 0.15,
+    "target_price_discount": 0.08,
+    "max_price_margin": 0.05,
+    "estimated_costs_percent": 0.03
+  },
+  "urgency_keywords": [
+    "urgente", "urge", "viajo", "viaje", "mudanza", "solo por hoy", "charlable",
+    "oportunidad", "negociable", "escucho", "ofertas", "liquido", "líquido",
+    "vendo ya", "necesito", "liquido", "regalo", "escucho", "ofertas",
+    "ganga", "oferta", "rebajado", "bajo", "acepto"
+  ],
+  "agency_keywords": [
+    "automotores", "motors", "cars", "automotive",
+    "concesionario", "agencia", "multimarca", "car house"
+  ]
+}
