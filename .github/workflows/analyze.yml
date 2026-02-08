@@ -1,0 +1,102 @@
+name: 📊 Análisis de Oportunidades
+
+on:
+  # Ejecutar después del scraping diario (7:00 UTC, una hora después)
+  schedule:
+    - cron: '0 7 * * *'
+  
+  # Ejecutar manualmente
+  workflow_dispatch:
+    inputs:
+      generate_csv:
+        description: 'Generar CSV para investigación'
+        type: boolean
+        default: true
+
+jobs:
+  analyze:
+    name: 🎯 Analizar Mercado
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 📥 Descargar BD más reciente
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: rosariogarage-master-db
+          workflow: scrape.yml
+          workflow_conclusion: success
+      
+      - name: 📂 Crear directorios de config
+        run: |
+          mkdir -p config reports
+          
+          # Crear config si no existe
+          if [ ! -f config/analysis_config.json ]; then
+            cat > config/analysis_config.json << 'EOF'
+          {
+            "filtering": {
+              "min_price_usd": 1000,
+              "max_price_usd": 500000,
+              "min_year": 1990,
+              "max_year": 2025,
+              "min_samples_for_stats": 5
+            },
+            "statistics": {
+              "spread_threshold_high": 15,
+              "volume_threshold_high": 10,
+              "anomaly_threshold_percent": 15
+            },
+            "urgency_keywords": [
+              "urgente", "urge", "viajo", "viaje", "mudanza",
+              "oportunidad", "negociable", "escucho", "ofertas"
+            ]
+          }
+          EOF
+          fi
+          
+          if [ ! -f config/brand_aliases.json ]; then
+            cat > config/brand_aliases.json << 'EOF'
+          {
+            "brand_aliases": {
+              "vw": "Volkswagen",
+              "chev": "Chevrolet",
+              "mercedes": "Mercedes-Benz"
+            }
+          }
+          EOF
+          fi
+      
+      - name: 🎯 Ejecutar análisis
+        run: |
+          python opportunity_analyzer.py --report --csv --debug
+      
+      - name: 📤 Subir reportes como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-reports
+          path: reports/
+          retention-days: 30
+      
+      - name: 📝 Mostrar resumen en Job Summary
+        run: |
+          echo "# 📊 Análisis de Oportunidades" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Fecha:** $(date +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f reports/MARKET_ANALYSIS.md ]; then
+            # Extraer primeras secciones del reporte
+            head -100 reports/MARKET_ANALYSIS.md >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "📥 **Descargar reportes completos:** Ver Artifacts" >> $GITHUB_STEP_SUMMARY
