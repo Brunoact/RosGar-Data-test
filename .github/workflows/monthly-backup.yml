@@ -4,7 +4,6 @@ on:
   schedule:
     # Día 1 de cada mes a las 12:00 UTC
     - cron: '0 12 1 * *'
-  
   workflow_dispatch:
 
 jobs:
@@ -16,16 +15,16 @@ jobs:
       - name: 📥 Descargar última BD consolidada
         uses: dawidd6/action-download-artifact@v3
         with:
-          name: rosariogarage-db
+          name: rosariogarage-master-db
           workflow: scrape.yml
           workflow_conclusion: success
-
+      
       - name: 📅 Obtener fecha
         id: date
         run: |
           echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
           echo "full=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-
+      
       - name: 📊 Generar info del backup
         id: info
         run: |
@@ -34,15 +33,12 @@ jobs:
           import os
           
           conn = sqlite3.connect('rosariogarage.db')
-          
           total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
           activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
           history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
-          
           size_bytes = os.path.getsize('rosariogarage.db')
           size_mb = size_bytes / 1024 / 1024
           
-          # Guardar en GITHUB_OUTPUT
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"total_vehicles={total}\n")
               f.write(f"active_vehicles={activos}\n")
@@ -51,12 +47,11 @@ jobs:
           
           conn.close()
           EOF
-
-      - name: 🗜️ Comprimir BD (opcional, solo si >50MB)
+      
+      - name: 🗜️ Comprimir BD si es grande
         id: compress
         run: |
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
-          
           if [ $SIZE_MB -gt 50 ]; then
             echo "💾 BD grande ($SIZE_MB MB), comprimiendo..."
             gzip -9 rosariogarage.db
@@ -67,8 +62,8 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
             echo "filename=rosariogarage.db" >> $GITHUB_OUTPUT
           fi
-
-      - name: 📦 Crear Release con Backup
+      
+      - name: 📦 Crear Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: backup-${{ steps.date.outputs.month }}
@@ -79,40 +74,19 @@ jobs:
             **📅 Fecha:** ${{ steps.date.outputs.full }}
             
             ### 📊 Estadísticas
-            
             - 🚗 **Vehículos totales:** ${{ steps.info.outputs.total_vehicles }}
             - ✅ **Activos:** ${{ steps.info.outputs.active_vehicles }}
-            - 📈 **Registros de historial:** ${{ steps.info.outputs.history_records }}
+            - 📈 **Registros historial:** ${{ steps.info.outputs.history_records }}
             - 💾 **Tamaño:** ${{ steps.info.outputs.size_mb }} MB
             
-            ### 📥 Cómo usar este backup
-            
+            ### 📥 Uso
             ```bash
-            # Descargar el backup
             gh release download backup-${{ steps.date.outputs.month }} -p "rosariogarage.db*"
-            
-            # Si está comprimido
-            gunzip rosariogarage.db.gz  # Solo si es .gz
-            
-            # Consultar datos
+            gunzip rosariogarage.db.gz  # Si está comprimido
             sqlite3 rosariogarage.db "SELECT COUNT(*) FROM vehicles WHERE activo = 1;"
             ```
-            
-            ### 🔍 Consultas útiles
-            
-            Ver `query_database.py` en el repositorio para ejemplos de consultas.
-            
-            ---
-            
-            🤖 Generado automáticamente el primer día del mes
           files: ${{ steps.compress.outputs.filename }}
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: ✅ Backup completado
-        run: |
-          echo "✅ Backup creado exitosamente en Releases"
-          echo "📦 Tag: backup-${{ steps.date.outputs.month }}"
-          echo "💾 Archivo: ${{ steps.compress.outputs.filename }}"
