@@ -1,0 +1,253 @@
+name: 🚗 Scraping RosarioGarage
+
+on:
+  schedule:
+    # Ejecutar diariamente a las 6:00 UTC (3:00 AM Argentina)
+    - cron: '0 6 * * *'
+  
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Modo debug (más logs)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  TOTAL_WORKERS: 8
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # JOB 1: Scraping distribuido en 8 workers
+  # ══════════════════════════════════════════════════════════════
+  scrape:
+    name: 🔹 Worker ${{ matrix.worker_id }}
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: true  # Si un worker falla, cancelar todos
+      max-parallel: 8
+      matrix:
+        worker_id: [0, 1, 2, 3, 4, 5, 6, 7]
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 📦 Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🚀 Ejecutar Worker ${{ matrix.worker_id }}
+        env:
+          WORKER_ID: ${{ matrix.worker_id }}
+          TOTAL_WORKERS: ${{ env.TOTAL_WORKERS }}
+          DEBUG_MODE: ${{ inputs.debug || 'false' }}
+        run: python scraper_rosariogarage.py
+        timeout-minutes: 30
+
+      - name: 📊 Info de la BD del worker
+        if: success()
+        run: |
+          ls -lh rosariogarage_worker_${{ matrix.worker_id }}.db
+          echo "Tamaño: $(du -h rosariogarage_worker_${{ matrix.worker_id }}.db | cut -f1)"
+
+      - name: 📤 Subir BD parcial como artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.worker_id }}-db
+          path: rosariogarage_worker_${{ matrix.worker_id }}.db
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 2: Consolidar resultados de todos los workers
+  # ══════════════════════════════════════════════════════════════
+  consolidate:
+    name: 📊 Consolidar Resultados
+    runs-on: ubuntu-latest
+    needs: scrape
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Instalar dependencias
+        run: pip install aiosqlite
+
+      - name: 📥 Descargar BD maestra anterior (si existe)
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          name: rosariogarage-db
+          workflow: scrape.yml
+          workflow_conclusion: success
+          if_no_artifact_found: ignore
+
+      - name: 📥 Descargar todas las BDs de workers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: worker-*-db
+          merge-multiple: true
+
+      - name: 📋 Verificar archivos descargados
+        run: |
+          echo "=== Archivos .db encontrados ==="
+          ls -lh *.db 2>/dev/null || echo "⚠️ No se encontraron archivos .db"
+          echo ""
+          echo "=== Total archivos ==="
+          ls -la
+
+      - name: 🔄 Consolidar todas las BDs
+        env:
+          CONSOLIDATE_MODE: 'true'
+          TOTAL_WORKERS: ${{ env.TOTAL_WORKERS }}
+        run: python scraper_rosariogarage.py
+        timeout-minutes: 10
+
+      - name: 📊 Generar estadísticas
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import sqlite3
+          from datetime import date
+          
+          conn = sqlite3.connect('rosariogarage.db')
+          
+          print("=" * 60)
+          print("📊 RESUMEN DEL SCRAPING")
+          print("=" * 60)
+          print(f"📅 Fecha: {date.today()}")
+          print()
+          
+          # Vehículos
+          total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+          activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
+          inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
+          
+          print(f"🚗 VEHÍCULOS")
+          print(f"   Total en BD:     {total:,}")
+          print(f"   ├─ Activos:      {activos:,}")
+          print(f"   └─ Inactivos:    {inactivos:,}")
+          print()
+          
+          # Nuevos y cambios hoy
+          today = date.today().isoformat()
+          nuevos_hoy = conn.execute(
+              "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
+          ).fetchone()[0]
+          
+          cambios_precio_hoy = conn.execute(
+              "SELECT COUNT(*) FROM price_history WHERE fecha = ?", (today,)
+          ).fetchone()[0]
+          
+          inactivos_hoy = conn.execute(
+              "SELECT COUNT(*) FROM vehicles WHERE activo = 0 AND ultima_vista = date('now', '-1 day')"
+          ).fetchone()[0]
+          
+          print(f"📈 CAMBIOS HOY")
+          print(f"   Nuevos:          {nuevos_hoy:,}")
+          print(f"   Cambios precio:  {cambios_precio_hoy:,}")
+          print(f"   Vendidos/Inact:  {inactivos_hoy:,}")
+          print()
+          
+          # Top marcas
+          print(f"🏭 TOP 10 MARCAS (Activos)")
+          for marca, count in conn.execute("""
+              SELECT marca, COUNT(*) as c 
+              FROM vehicles 
+              WHERE activo = 1 AND marca IS NOT NULL
+              GROUP BY marca 
+              ORDER BY c DESC 
+              LIMIT 10
+          """):
+              print(f"   {marca:15s} {count:4,}")
+          print()
+          
+          # Historial total
+          total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+          print(f"📜 Registros de historial: {total_history:,}")
+          
+          # Metadata
+          dolar = conn.execute(
+              "SELECT value FROM scrape_metadata WHERE key = 'last_dolar_mep'"
+          ).fetchone()
+          if dolar:
+              print(f"💵 Dólar MEP usado: ${float(dolar[0]):.2f}")
+          
+          rate_limits = conn.execute(
+              "SELECT value FROM scrape_metadata WHERE key = 'rate_limits_429'"
+          ).fetchone()
+          if rate_limits and int(rate_limits[0]) > 0:
+              print(f"⚠️ Rate limits detectados: {rate_limits[0]}")
+          
+          print("=" * 60)
+          
+          conn.close()
+          PYTHON_SCRIPT
+
+      - name: 📊 Tamaño final de la BD
+        run: |
+          SIZE_MB=$(du -m rosariogarage.db | cut -f1)
+          SIZE_HR=$(du -h rosariogarage.db | cut -f1)
+          echo "💾 Tamaño: $SIZE_HR ($SIZE_MB MB)"
+          
+          if [ $SIZE_MB -gt 100 ]; then
+            echo "⚠️ ADVERTENCIA: La BD supera 100 MB. Considera habilitar Git LFS."
+          fi
+
+      - name: 📤 Subir BD consolidada
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-db
+          path: rosariogarage.db
+          retention-days: 90
+          compression-level: 6
+          if-no-files-found: error
+
+      - name: 📝 Crear resumen del workflow
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## ✅ Scraping Completado
+          
+          **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
+          
+          ### 📊 Estadísticas
+          
+          Ver los logs del paso "Generar estadísticas" para detalles completos.
+          
+          ### 📥 Archivos Generados
+          
+          - `rosariogarage.db` - Base de datos consolidada (disponible en Artifacts por 90 días)
+          
+          EOF
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 3: Notificación en caso de error
+  # ══════════════════════════════════════════════════════════════
+  notify-failure:
+    name: 🚨 Notificar Fallo
+    runs-on: ubuntu-latest
+    needs: [scrape, consolidate]
+    if: failure()
+    
+    steps:
+      - name: 📝 Registrar fallo
+        run: |
+          echo "❌ El scraping falló. Se reintentará mañana."
+          echo "Revisa los logs de los workers para más detalles."
+          exit 0  # No fallar este job
