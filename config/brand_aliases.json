@@ -1,0 +1,33 @@
+{
+  "brand_aliases": {
+    "vw": "Volkswagen",
+    "volkswagen": "Volkswagen",
+    "volks": "Volkswagen",
+    "chev": "Chevrolet",
+    "chevrolet": "Chevrolet",
+    "chevy": "Chevrolet",
+    "gm": "Chevrolet",
+    "mercedes": "Mercedes-Benz",
+    "mercedes-benz": "Mercedes-Benz",
+    "mercedes benz": "Mercedes-Benz",
+    "mb": "Mercedes-Benz",
+    "bmw": "BMW",
+    "alfa": "Alfa Romeo",
+    "alfa romeo": "Alfa Romeo",
+    "alfaromeo": "Alfa Romeo",
+    "citroen": "Citroën",
+    "citroën": "Citroën",
+    "ds": "DS",
+    "land rover": "Land Rover",
+    "landrover": "Land Rover",
+    "range rover": "Land Rover"
+  },
+  "brands_to_skip": [
+    "N/A",
+    "n/a",
+    "",
+    "null",
+    "otros",
+    "other"
+  ]
+}
