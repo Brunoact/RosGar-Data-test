@@ -1117,6 +1117,42 @@ def consolidate_worker_results():
         fatal_error("Error durante consolidación", e)
 
 
+async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
+    """Obtiene una página del listado."""
+    url = f"{LISTING_URL}&o={offset}"
+    
+    resp = await http.fetch_listing(url)
+    if not resp:
+        return []
+    
+    try:
+        html = decode_response(resp)
+        
+        # DEBUG: Ver qué HTML estamos recibiendo
+        if offset == 0:  # Solo para la primera página
+            logger.info(f"📝 HTML preview (primeros 500 chars): {html[:500]}")
+        
+        soup = BeautifulSoup(html, 'lxml')
+        
+        # DEBUG: Verificar si hay divs con data-rel
+        all_divs = soup.find_all('div', attrs={'data-rel': True})
+        logger.info(f"   Found {len(all_divs)} divs with data-rel attribute")
+        
+        vehicles = []
+        for div in soup.select('div[data-rel]'):
+            v = parse_listing_item(div)
+            if v and v.get('id'):
+                vehicles.append(v)
+        
+        # DEBUG: Si no hay vehículos, buscar otros elementos
+        if not vehicles:
+            logger.warning(f"   No vehicles found. Title tag: {soup.title.string if soup.title else 'No title'}")
+            # Buscar cualquier elemento que parezca un listado
+            possible_items = soup.select('.box_aviso, .item, .vehicle, .car')
+            logger.warning(f"   Found {len(possible_items)} possible item containers")
+        
+        return vehicles
+
 # ═══════════════════════════════════════════════════════════════
 # 🚀 FUNCIÓN PRINCIPAL DEL WORKER
 # ═══════════════════════════════════════════════════════════════
