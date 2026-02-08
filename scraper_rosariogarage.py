@@ -41,28 +41,28 @@ CONSOLIDATE_MODE = os.environ.get('CONSOLIDATE_MODE', 'false').lower() == 'true'
 WORKER_DB = f'{WORKER_DB_PREFIX}{WORKER_ID}.db'
 
 # ═══════════════════════════════════════════════════════════════
-# 🚀 CONFIGURACIÓN DE RENDIMIENTO - CONSERVADORA
+# 🚀 CONFIGURACIÓN DE RENDIMIENTO - OPTIMIZADA SEGÚN TEST
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class ScraperConfig:
-    # Concurrencia conservadora
-    max_concurrent_listings: int = 5
-    max_concurrent_details: int = 40
-    max_connections: int = 60
-    max_keepalive: int = 20
+    # Concurrencia basada en resultados del test
+    max_concurrent_listings: int = 8       # Burst seguro según test
+    max_concurrent_details: int = 30       # El servidor acepta 30 burst sin problemas
+    max_connections: int = 50               # Suficiente para nuestras necesidades
+    max_keepalive: int = 20                # Mantener conexiones vivas
     
-    # Timeouts generosos
-    connect_timeout: float = 15.0
-    read_timeout: float = 20.0
+    # Timeouts ajustados a latencia observada (~700ms)
+    connect_timeout: float = 5.0
+    read_timeout: float = 10.0
     
     # Reintentos
     max_retries: int = 3
-    retry_delay: float = 1.0
+    retry_delay: float = 0.5
     
-    # Rate limiting conservador
-    delay_between_batches: float = 0.15    # 150ms entre batches
-    batch_size: int = 30
-    request_jitter: Tuple[float, float] = (0.05, 0.15)  # Delay aleatorio entre requests
+    # Rate limiting basado en test (14 req/s máximo recomendado)
+    delay_between_batches: float = 0.05    # 50ms entre batches
+    batch_size: int = 25                   # Batches moderados
+    # Sin jitter aleatorio - no es necesario según el test
 
 CONFIG = ScraperConfig()
 
@@ -247,41 +247,16 @@ def init_master_db(db_path: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🌐 HTTP CLIENT CON ANTI-DETECCIÓN
+# 🌐 HTTP CLIENT OPTIMIZADO - SIMPLIFICADO Y CORREGIDO
 # ═══════════════════════════════════════════════════════════════
 
-# User-Agents reales y actualizados
-USER_AGENTS = [
-    # Chrome Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    # Chrome Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # Firefox Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    # Firefox Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
-    # Safari Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    # Edge
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-]
-
-
 class FastHTTPClient:
-    """Cliente HTTP optimizado con anti-detección."""
+    """Cliente HTTP optimizado - VERSIÓN SIMPLIFICADA."""
     
     def __init__(self):
         self.client: Optional[httpx.AsyncClient] = None
         self.semaphore_listings: Optional[asyncio.Semaphore] = None
         self.semaphore_details: Optional[asyncio.Semaphore] = None
-        self.user_agent = self._generate_user_agent()
-    
-    def _generate_user_agent(self) -> str:
-        """Genera un User-Agent único y consistente por worker."""
-        # Cada worker usa un UA diferente pero consistente
-        return USER_AGENTS[WORKER_ID % len(USER_AGENTS)]
     
     async def __aenter__(self):
         try:
@@ -297,34 +272,20 @@ class FastHTTPClient:
                 pool=5.0
             )
             
-            # Headers que simulan navegador real
-            headers = {
-                'User-Agent': self.user_agent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-            }
-            
+            # ✅ CAMBIO CRÍTICO: Sin headers personalizados - usar defaults de httpx
+            # Los headers Sec-Fetch-* estaban causando problemas
             self.client = httpx.AsyncClient(
                 limits=limits,
                 timeout=timeout,
                 follow_redirects=True,
-                http2=True,
-                headers=headers,
+                http2=True,  # HTTP/2 para mejor rendimiento
+                # NO especificar headers - los defaults funcionan mejor
             )
             
             self.semaphore_listings = asyncio.Semaphore(CONFIG.max_concurrent_listings)
             self.semaphore_details = asyncio.Semaphore(CONFIG.max_concurrent_details)
             
-            logger.info(f"🌐 HTTP Client inicializado (UA: {self.user_agent[:50]}...)")
+            logger.info(f"🌐 HTTP Client inicializado (HTTP/2 habilitado)")
             
             return self
         except Exception as e:
@@ -340,13 +301,10 @@ class FastHTTPClient:
         semaphore: asyncio.Semaphore,
         retries: int = CONFIG.max_retries
     ) -> Optional[httpx.Response]:
-        """Fetch con reintentos, jitter y manejo de rate limiting."""
+        """Fetch con reintentos - SIMPLIFICADO."""
         
         async with semaphore:
-            # Jitter inicial para evitar sincronización perfecta entre workers
-            await asyncio.sleep(random.uniform(*CONFIG.request_jitter))
-            
-            last_error = None
+            # ✅ Sin delays aleatorios innecesarios
             
             for attempt in range(retries):
                 try:
@@ -357,20 +315,14 @@ class FastHTTPClient:
                     if resp.status_code == 200:
                         STATS.requests_success += 1
                         STATS.bytes_downloaded += len(resp.content)
-                        
-                        # Delay aleatorio después de request exitoso (simular humano)
-                        await asyncio.sleep(random.uniform(0.05, 0.12))
-                        
+                        # ✅ Sin delay después de request exitoso
                         return resp
                     
-                    # Rate limiting - backoff exponencial con jitter
+                    # Rate limiting - aunque el test no lo detectó, mantener por seguridad
                     if resp.status_code == 429:
                         STATS.requests_429 += 1
-                        wait = (attempt + 1) * 3 + random.uniform(0, 2)
-                        logger.warning(
-                            f"⚠️ Rate limit detectado (total: {STATS.requests_429}), "
-                            f"esperando {wait:.1f}s..."
-                        )
+                        wait = (attempt + 1) * 2
+                        logger.warning(f"⚠️ Rate limit detectado, esperando {wait}s...")
                         await asyncio.sleep(wait)
                         STATS.retries += 1
                         continue
@@ -378,32 +330,19 @@ class FastHTTPClient:
                     # Errores de servidor - reintentar
                     if resp.status_code >= 500:
                         STATS.retries += 1
-                        wait = CONFIG.retry_delay * (attempt + 1) + random.uniform(0, 1)
-                        logger.warning(f"Error {resp.status_code} en {url}, reintentando en {wait:.1f}s...")
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
                         continue
                     
                     # Otros errores (4xx) - no reintentar
                     STATS.requests_failed += 1
-                    logger.warning(f"HTTP {resp.status_code} en {url}")
+                    if DEBUG_MODE:
+                        logger.debug(f"HTTP {resp.status_code} en {url}")
                     return None
                     
-                except httpx.TimeoutException as e:
-                    last_error = e
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
                     STATS.retries += 1
                     if attempt < retries - 1:
-                        wait = CONFIG.retry_delay * (attempt + 1) + random.uniform(0, 1)
-                        logger.warning(f"Timeout en {url}, reintentando en {wait:.1f}s...")
-                        await asyncio.sleep(wait)
-                    continue
-                
-                except httpx.ConnectError as e:
-                    last_error = e
-                    STATS.retries += 1
-                    if attempt < retries - 1:
-                        wait = CONFIG.retry_delay * (attempt + 1) + random.uniform(0, 1)
-                        logger.warning(f"Error de conexión en {url}, reintentando en {wait:.1f}s...")
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
                     continue
                         
                 except Exception as e:
@@ -412,13 +351,13 @@ class FastHTTPClient:
             
             # Se agotaron los reintentos
             STATS.requests_failed += 1
-            logger.error(f"❌ Agotados {retries} reintentos para {url}: {last_error}")
+            logger.error(f"❌ Agotados {retries} reintentos para {url}")
             
-            # Si hay demasiados fallos, abortar completamente
+            # Si hay demasiados fallos, abortar
             if STATS.requests_failed > 50:
                 fatal_error(
                     f"Demasiados errores de red ({STATS.requests_failed} fallos). "
-                    "Posible problema de conectividad o bloqueo del sitio."
+                    "Posible problema de conectividad."
                 )
             
             return None
@@ -460,7 +399,7 @@ async def get_dolar_from_api() -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📋 PARSING
+# 📋 PARSING - SIN CAMBIOS (FUNCIONA BIEN)
 # ═══════════════════════════════════════════════════════════════
 
 RE_YEAR = re.compile(r'^(19|20)\d{2}$')
@@ -587,7 +526,7 @@ def parse_precio(precio_text: str, dolar_mep: float) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📄 SCRAPING DEL LISTADO
+# 📄 SCRAPING DEL LISTADO - PARALELO OPTIMIZADO
 # ═══════════════════════════════════════════════════════════════
 
 async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
@@ -600,6 +539,12 @@ async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
     
     try:
         html = decode_response(resp)
+        
+        # Debug en primera página
+        if DEBUG_MODE and offset == 0:
+            logger.debug(f"📝 HTML length: {len(html)} chars")
+            count = html.count('data-rel=')
+            logger.debug(f"📝 'data-rel=' occurrences: {count}")
         
         try:
             soup = BeautifulSoup(html, 'lxml')
@@ -619,7 +564,7 @@ async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
 
 
 async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
-    """Obtiene los listados correspondientes a este worker."""
+    """Obtiene los listados correspondientes a este worker - OPTIMIZADO."""
     start_page, end_page = calculate_page_range()
     
     logger.info(f"🔀 Worker {WORKER_ID}/{TOTAL_WORKERS}: Páginas {start_page} a {end_page}")
@@ -635,6 +580,7 @@ async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
     for i in range(0, len(offsets), batch_size):
         batch_offsets = offsets[i:i + batch_size]
         
+        # Lanzar requests en paralelo
         tasks = [fetch_listing_page(http, offset) for offset in batch_offsets]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -663,8 +609,9 @@ async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
         else:
             empty_count = 0
         
+        page_range = f"{i//batch_size * batch_size + start_page}-{min(i//batch_size * batch_size + batch_size - 1 + start_page, end_page)}"
         logger.info(
-            f"  Batch {i//batch_size + 1}: +{batch_new} nuevos | "
+            f"  Páginas {page_range}: +{batch_new} nuevos | "
             f"Total: {len(all_vehicles)} | {STATS.rps():.1f} req/s | "
             f"Éxito: {STATS.success_rate():.1f}%"
         )
@@ -682,7 +629,7 @@ async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🚗 SCRAPING DE DETALLES
+# 🚗 SCRAPING DE DETALLES - PARALELO OPTIMIZADO
 # ═══════════════════════════════════════════════════════════════
 
 async def fetch_vehicle_details(
@@ -760,7 +707,7 @@ async def fetch_all_details(
     vehicles: List[Dict], 
     dolar_mep: float
 ) -> List[Dict]:
-    """Obtiene todos los detalles en paralelo."""
+    """Obtiene todos los detalles en paralelo - OPTIMIZADO."""
     total = len(vehicles)
     logger.info(f"🚗 Worker {WORKER_ID}: Obteniendo detalles de {total} vehículos...")
     
@@ -770,6 +717,7 @@ async def fetch_all_details(
     for i in range(0, total, batch_size):
         batch = vehicles[i:i + batch_size]
         
+        # Lanzar todas las requests del batch en paralelo
         tasks = [fetch_vehicle_details(http, v, dolar_mep) for v in batch]
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -784,9 +732,9 @@ async def fetch_all_details(
         pct = (processed / total) * 100
         
         logger.info(
-            f"  Detalles: {processed}/{total} ({pct:.0f}%) | "
+            f"  Procesados: {processed}/{total} ({pct:.0f}%) | "
             f"Válidos: {len(results)} | {STATS.rps():.1f} req/s | "
-            f"Rate limits: {STATS.requests_429}"
+            f"Errores: {STATS.requests_failed}"
         )
         
         if CONFIG.delay_between_batches > 0:
@@ -810,7 +758,7 @@ async def fetch_all_details(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 💾 GUARDAR DATOS DEL WORKER
+# 💾 GUARDAR DATOS DEL WORKER - SIN CAMBIOS
 # ═══════════════════════════════════════════════════════════════
 
 async def save_worker_results(results: List[Dict], dolar_mep: float):
@@ -870,7 +818,7 @@ async def save_worker_results(results: List[Dict], dolar_mep: float):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔄 CONSOLIDACIÓN DE WORKERS
+# 🔄 CONSOLIDACIÓN DE WORKERS - SIN CAMBIOS
 # ═══════════════════════════════════════════════════════════════
 
 def consolidate_worker_results():
@@ -1116,6 +1064,7 @@ def consolidate_worker_results():
     except Exception as e:
         fatal_error("Error durante consolidación", e)
 
+
 # ═══════════════════════════════════════════════════════════════
 # 🚀 FUNCIÓN PRINCIPAL DEL WORKER
 # ═══════════════════════════════════════════════════════════════
@@ -1131,7 +1080,9 @@ async def run_worker():
     logger.info("=" * 60)
     logger.info(f"🚀 WORKER {WORKER_ID}/{TOTAL_WORKERS} INICIANDO")
     logger.info(f"   Páginas asignadas: {start_page} - {end_page}")
+    logger.info(f"   Concurrencia listados: {CONFIG.max_concurrent_listings}")
     logger.info(f"   Concurrencia detalles: {CONFIG.max_concurrent_details}")
+    logger.info(f"   HTTP/2: Habilitado")
     logger.info("=" * 60)
     
     try:
