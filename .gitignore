@@ -44,6 +44,13 @@ env/
 .DS_Store
 Thumbs.db
 
+# Reportes generados (descargar de Artifacts)
+reports/
+*.csv
+
+# Mantener config de ejemplo
+!config/
+
 # Logs
 *.log
 
