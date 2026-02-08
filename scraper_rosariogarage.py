@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import sqlite3
-import random
+import glob
 from datetime import datetime, date
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Any, Tuple
@@ -37,32 +37,23 @@ WORKER_DB_PREFIX = 'rosariogarage_worker_'
 WORKER_ID = int(os.environ.get('WORKER_ID', 0))
 TOTAL_WORKERS = int(os.environ.get('TOTAL_WORKERS', 1))
 CONSOLIDATE_MODE = os.environ.get('CONSOLIDATE_MODE', 'false').lower() == 'true'
-
 WORKER_DB = f'{WORKER_DB_PREFIX}{WORKER_ID}.db'
 
 # ═══════════════════════════════════════════════════════════════
-# 🚀 CONFIGURACIÓN DE RENDIMIENTO - OPTIMIZADA SEGÚN TEST
+# 🚀 CONFIGURACIÓN DE RENDIMIENTO
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class ScraperConfig:
-    # Concurrencia basada en resultados del test
-    max_concurrent_listings: int = 8       # Burst seguro según test
-    max_concurrent_details: int = 30       # El servidor acepta 30 burst sin problemas
-    max_connections: int = 50               # Suficiente para nuestras necesidades
-    max_keepalive: int = 20                # Mantener conexiones vivas
-    
-    # Timeouts ajustados a latencia observada (~700ms)
+    max_concurrent_listings: int = 8
+    max_concurrent_details: int = 30
+    max_connections: int = 50
+    max_keepalive: int = 20
     connect_timeout: float = 5.0
     read_timeout: float = 10.0
-    
-    # Reintentos
     max_retries: int = 3
     retry_delay: float = 0.5
-    
-    # Rate limiting basado en test (14 req/s máximo recomendado)
-    delay_between_batches: float = 0.05    # 50ms entre batches
-    batch_size: int = 25                   # Batches moderados
-    # Sin jitter aleatorio - no es necesario según el test
+    delay_between_batches: float = 0.05
+    batch_size: int = 25
 
 CONFIG = ScraperConfig()
 
@@ -95,7 +86,6 @@ STATS = Stats()
 # ═══════════════════════════════════════════════════════════════
 # 🔧 LOGGING Y MANEJO DE ERRORES
 # ═══════════════════════════════════════════════════════════════
-
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO if not DEBUG_MODE else logging.DEBUG,
@@ -106,12 +96,8 @@ def setup_logging():
 
 logger = setup_logging()
 
-
 def fatal_error(message: str, exception: Exception = None):
-    """
-    Error fatal: loguea y termina la ejecución inmediatamente.
-    El workflow de GitHub Actions fallará.
-    """
+    """Error fatal: loguea y termina la ejecución."""
     logger.critical("=" * 60)
     logger.critical(f"💀 ERROR FATAL: {message}")
     if exception:
@@ -120,21 +106,17 @@ def fatal_error(message: str, exception: Exception = None):
             import traceback
             logger.critical(traceback.format_exc())
     logger.critical("=" * 60)
-    logger.critical("⛔ Abortando ejecución. El workflow fallará hasta mañana.")
     sys.exit(1)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 🔧 FUNCIONES AUXILIARES
 # ═══════════════════════════════════════════════════════════════
-
 HTML_ENTITIES = str.maketrans({'\xa0': ' '})
 ENTITY_PATTERN = re.compile(r'&(\w+);')
 ENTITY_MAP = {
     'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á', 'eacute': 'é',
     'iacute': 'í', 'uacute': 'ú', 'ntilde': 'ñ', 'Ntilde': 'Ñ', 'amp': '&',
 }
-
 
 def clean_text(text: str) -> str:
     if not text:
@@ -143,13 +125,11 @@ def clean_text(text: str) -> str:
     text = ENTITY_PATTERN.sub(lambda m: ENTITY_MAP.get(m.group(1), m.group(0)), text)
     return ' '.join(text.split())
 
-
 def decode_response(resp: httpx.Response) -> str:
     try:
         return resp.content.decode('iso-8859-1', errors='ignore')
     except:
         return resp.text
-
 
 def calculate_page_range() -> Tuple[int, int]:
     """Calcula el rango de páginas para este worker."""
@@ -165,13 +145,29 @@ def calculate_page_range() -> Tuple[int, int]:
     
     return start_page, end_page
 
+def find_worker_databases() -> List[Tuple[int, str]]:
+    """Busca todas las bases de datos de workers disponibles."""
+    found = []
+    
+    # Buscar en directorio actual
+    for worker_id in range(TOTAL_WORKERS):
+        db_name = f'{WORKER_DB_PREFIX}{worker_id}.db'
+        if os.path.exists(db_name):
+            found.append((worker_id, db_name))
+            continue
+        
+        # Buscar en subdirectorios (por si acaso)
+        pattern = f'**/{db_name}'
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            found.append((worker_id, matches[0]))
+    
+    return found
 
 # ═══════════════════════════════════════════════════════════════
 # 💾 BASE DE DATOS SQLITE
 # ═══════════════════════════════════════════════════════════════
-
 SCHEMA_SQL = """
--- Tabla principal de vehículos
 CREATE TABLE IF NOT EXISTS vehicles (
     id TEXT PRIMARY KEY,
     url TEXT UNIQUE NOT NULL,
@@ -198,7 +194,6 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_marca ON vehicles(marca);
 CREATE INDEX IF NOT EXISTS idx_vehicles_ultima_vista ON vehicles(ultima_vista);
 CREATE INDEX IF NOT EXISTS idx_vehicles_precio_usd ON vehicles(precio_usd);
 
--- Historial de precios (solo cuando cambia)
 CREATE TABLE IF NOT EXISTS price_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vehicle_id TEXT NOT NULL,
@@ -212,18 +207,16 @@ CREATE TABLE IF NOT EXISTS price_history (
 CREATE INDEX IF NOT EXISTS idx_history_vehicle ON price_history(vehicle_id);
 CREATE INDEX IF NOT EXISTS idx_history_fecha ON price_history(fecha);
 
--- Metadatos de ejecución
 CREATE TABLE IF NOT EXISTS scrape_metadata (
     key TEXT PRIMARY KEY,
     value TEXT
 );
 """
 
-
 async def init_worker_db(db_path: str):
     """Inicializa la base de datos del worker."""
     if not HAS_AIOSQLITE:
-        fatal_error("aiosqlite no está instalado. Ejecutar: pip install aiosqlite")
+        fatal_error("aiosqlite no está instalado")
     
     try:
         async with aiosqlite.connect(db_path) as db:
@@ -232,7 +225,6 @@ async def init_worker_db(db_path: str):
         logger.info(f"✅ Base de datos inicializada: {db_path}")
     except Exception as e:
         fatal_error(f"Error inicializando base de datos {db_path}", e)
-
 
 def init_master_db(db_path: str):
     """Inicializa la base de datos maestra (síncrono)."""
@@ -245,13 +237,11 @@ def init_master_db(db_path: str):
     except Exception as e:
         fatal_error(f"Error inicializando base de datos maestra {db_path}", e)
 
-
 # ═══════════════════════════════════════════════════════════════
-# 🌐 HTTP CLIENT OPTIMIZADO - SIMPLIFICADO Y CORREGIDO
+# 🌐 HTTP CLIENT OPTIMIZADO
 # ═══════════════════════════════════════════════════════════════
-
 class FastHTTPClient:
-    """Cliente HTTP optimizado - VERSIÓN SIMPLIFICADA."""
+    """Cliente HTTP optimizado."""
     
     def __init__(self):
         self.client: Optional[httpx.AsyncClient] = None
@@ -264,7 +254,6 @@ class FastHTTPClient:
                 max_connections=CONFIG.max_connections,
                 max_keepalive_connections=CONFIG.max_keepalive,
             )
-            
             timeout = httpx.Timeout(
                 connect=CONFIG.connect_timeout,
                 read=CONFIG.read_timeout,
@@ -272,21 +261,17 @@ class FastHTTPClient:
                 pool=5.0
             )
             
-            # ✅ CAMBIO CRÍTICO: Sin headers personalizados - usar defaults de httpx
-            # Los headers Sec-Fetch-* estaban causando problemas
             self.client = httpx.AsyncClient(
                 limits=limits,
                 timeout=timeout,
                 follow_redirects=True,
-                http2=True,  # HTTP/2 para mejor rendimiento
-                # NO especificar headers - los defaults funcionan mejor
+                http2=True,
             )
             
             self.semaphore_listings = asyncio.Semaphore(CONFIG.max_concurrent_listings)
             self.semaphore_details = asyncio.Semaphore(CONFIG.max_concurrent_details)
             
-            logger.info(f"🌐 HTTP Client inicializado (HTTP/2 habilitado)")
-            
+            logger.info(f"🌐 HTTP Client inicializado (HTTP/2)")
             return self
         except Exception as e:
             fatal_error("Error inicializando HTTP client", e)
@@ -301,64 +286,47 @@ class FastHTTPClient:
         semaphore: asyncio.Semaphore,
         retries: int = CONFIG.max_retries
     ) -> Optional[httpx.Response]:
-        """Fetch con reintentos - SIMPLIFICADO."""
-        
+        """Fetch con reintentos."""
         async with semaphore:
-            # ✅ Sin delays aleatorios innecesarios
-            
             for attempt in range(retries):
                 try:
                     STATS.requests_made += 1
-                    
                     resp = await self.client.get(url)
                     
                     if resp.status_code == 200:
                         STATS.requests_success += 1
                         STATS.bytes_downloaded += len(resp.content)
-                        # ✅ Sin delay después de request exitoso
                         return resp
                     
-                    # Rate limiting - aunque el test no lo detectó, mantener por seguridad
                     if resp.status_code == 429:
                         STATS.requests_429 += 1
                         wait = (attempt + 1) * 2
-                        logger.warning(f"⚠️ Rate limit detectado, esperando {wait}s...")
+                        logger.warning(f"⚠️ Rate limit, esperando {wait}s...")
                         await asyncio.sleep(wait)
                         STATS.retries += 1
                         continue
                     
-                    # Errores de servidor - reintentar
                     if resp.status_code >= 500:
                         STATS.retries += 1
                         await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
                         continue
                     
-                    # Otros errores (4xx) - no reintentar
                     STATS.requests_failed += 1
-                    if DEBUG_MODE:
-                        logger.debug(f"HTTP {resp.status_code} en {url}")
                     return None
                     
                 except (httpx.TimeoutException, httpx.ConnectError) as e:
                     STATS.retries += 1
                     if attempt < retries - 1:
                         await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
-                    continue
-                        
+                        continue
                 except Exception as e:
-                    # Cualquier otro error es fatal
                     fatal_error(f"Error inesperado en request a {url}", e)
             
-            # Se agotaron los reintentos
             STATS.requests_failed += 1
             logger.error(f"❌ Agotados {retries} reintentos para {url}")
             
-            # Si hay demasiados fallos, abortar
             if STATS.requests_failed > 50:
-                fatal_error(
-                    f"Demasiados errores de red ({STATS.requests_failed} fallos). "
-                    "Posible problema de conectividad."
-                )
+                fatal_error(f"Demasiados errores de red ({STATS.requests_failed} fallos)")
             
             return None
     
@@ -368,13 +336,11 @@ class FastHTTPClient:
     async def fetch_detail(self, url: str) -> Optional[httpx.Response]:
         return await self.fetch(url, self.semaphore_details)
 
-
 # ═══════════════════════════════════════════════════════════════
 # 💵 OBTENCIÓN DEL DÓLAR
 # ═══════════════════════════════════════════════════════════════
-
 async def get_dolar_from_api() -> float:
-    """Obtiene cotización del dólar. Falla fatalmente si no puede."""
+    """Obtiene cotización del dólar."""
     apis = [
         ("https://dolarapi.com/v1/dolares/bolsa", lambda r: r.json()['venta']),
         ("https://api.bluelytics.com.ar/v2/latest", lambda r: r.json()['blue']['value_sell']),
@@ -397,15 +363,12 @@ async def get_dolar_from_api() -> float:
     
     fatal_error("No se pudo obtener cotización del dólar de ninguna API")
 
-
 # ═══════════════════════════════════════════════════════════════
-# 📋 PARSING - SIN CAMBIOS (FUNCIONA BIEN)
+# 📋 PARSING
 # ═══════════════════════════════════════════════════════════════
-
 RE_YEAR = re.compile(r'^(19|20)\d{2}$')
 RE_DIGITS = re.compile(r'[^\d]')
 RE_PRICE = re.compile(r'(\d+\.?\d*)')
-
 FUEL_TYPES = {'nafta', 'diesel', 'gnc', 'híbrido', 'eléctrico', 'gas'}
 
 DETAIL_PATTERNS = {
@@ -417,7 +380,6 @@ DETAIL_PATTERNS = {
     'combustible': re.compile(r'<span>Combustible:</span>\s*(?:&nbsp;)?\s*([^<]+)', re.I),
     'vendedor': re.compile(r'<span>Vendedor:</span>\s*(?:&nbsp;)?\s*([^<]+)', re.I),
 }
-
 
 def parse_listing_item(item_div) -> Optional[Dict]:
     """Extrae datos de un item del listado."""
@@ -470,12 +432,10 @@ def parse_listing_item(item_div) -> Optional[Dict]:
             logger.debug(f"Error parseando item: {e}")
         return None
 
-
 def extract_marca_from_titulo(titulo: str) -> str:
     if not titulo or titulo == 'N/A':
         return 'N/A'
     return titulo.split()[0] if titulo.split() else 'N/A'
-
 
 def extract_modelo_from_titulo(titulo: str, marca: str) -> str:
     if not titulo or titulo == 'N/A':
@@ -485,7 +445,6 @@ def extract_modelo_from_titulo(titulo: str, marca: str) -> str:
     parts = titulo.split(maxsplit=1)
     return parts[1] if len(parts) > 1 else 'N/A'
 
-
 def parse_km(km_str) -> int:
     if not km_str:
         return 0
@@ -494,7 +453,6 @@ def parse_km(km_str) -> int:
         return int(clean) if clean else 0
     except:
         return 0
-
 
 def parse_precio(precio_text: str, dolar_mep: float) -> Dict:
     result = {'precio_ars': None, 'precio_usd': None}
@@ -524,27 +482,19 @@ def parse_precio(precio_text: str, dolar_mep: float) -> Dict:
     
     return result
 
-
 # ═══════════════════════════════════════════════════════════════
-# 📄 SCRAPING DEL LISTADO - PARALELO OPTIMIZADO
+# 📄 SCRAPING DEL LISTADO
 # ═══════════════════════════════════════════════════════════════
-
 async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
     """Obtiene una página del listado."""
     url = f"{LISTING_URL}&o={offset}"
-    
     resp = await http.fetch_listing(url)
+    
     if not resp:
         return []
     
     try:
         html = decode_response(resp)
-        
-        # Debug en primera página
-        if DEBUG_MODE and offset == 0:
-            logger.debug(f"📝 HTML length: {len(html)} chars")
-            count = html.count('data-rel=')
-            logger.debug(f"📝 'data-rel=' occurrences: {count}")
         
         try:
             soup = BeautifulSoup(html, 'lxml')
@@ -562,25 +512,20 @@ async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
         logger.error(f"Error procesando página offset={offset}: {e}")
         return []
 
-
 async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
-    """Obtiene los listados correspondientes a este worker - OPTIMIZADO."""
+    """Obtiene los listados correspondientes a este worker."""
     start_page, end_page = calculate_page_range()
-    
     logger.info(f"🔀 Worker {WORKER_ID}/{TOTAL_WORKERS}: Páginas {start_page} a {end_page}")
     
     all_vehicles = []
     seen_ids = set()
-    
     offsets = [page * ITEMS_PER_PAGE for page in range(start_page, end_page + 1)]
-    
     batch_size = CONFIG.max_concurrent_listings
     empty_count = 0
     
     for i in range(0, len(offsets), batch_size):
         batch_offsets = offsets[i:i + batch_size]
         
-        # Lanzar requests en paralelo
         tasks = [fetch_listing_page(http, offset) for offset in batch_offsets]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -604,16 +549,14 @@ async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
         if all_empty:
             empty_count += 1
             if empty_count >= 2:
-                logger.info(f"  ⚠️ 2 batches vacíos consecutivos, terminando paginación...")
+                logger.info(f"  ⚠️ 2 batches vacíos consecutivos, terminando...")
                 break
         else:
             empty_count = 0
         
-        page_range = f"{i//batch_size * batch_size + start_page}-{min(i//batch_size * batch_size + batch_size - 1 + start_page, end_page)}"
         logger.info(
-            f"  Páginas {page_range}: +{batch_new} nuevos | "
-            f"Total: {len(all_vehicles)} | {STATS.rps():.1f} req/s | "
-            f"Éxito: {STATS.success_rate():.1f}%"
+            f"  Páginas procesadas: +{batch_new} nuevos | "
+            f"Total: {len(all_vehicles)} | {STATS.rps():.1f} req/s"
         )
         
         if CONFIG.delay_between_batches > 0:
@@ -621,20 +564,17 @@ async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
     
     if not all_vehicles:
         fatal_error(
-            f"Worker {WORKER_ID}: No se encontraron vehículos en páginas {start_page}-{end_page}. "
-            "Posible problema con el sitio o cambio de estructura."
+            f"Worker {WORKER_ID}: No se encontraron vehículos en páginas {start_page}-{end_page}"
         )
     
     return all_vehicles
 
-
 # ═══════════════════════════════════════════════════════════════
-# 🚗 SCRAPING DE DETALLES - PARALELO OPTIMIZADO
+# 🚗 SCRAPING DE DETALLES
 # ═══════════════════════════════════════════════════════════════
-
 async def fetch_vehicle_details(
-    http: FastHTTPClient, 
-    vehicle_basic: Dict, 
+    http: FastHTTPClient,
+    vehicle_basic: Dict,
     dolar_mep: float
 ) -> Optional[Dict]:
     """Obtiene detalles de un vehículo."""
@@ -662,7 +602,6 @@ async def fetch_vehicle_details(
         'imagen': vehicle_basic.get('imagen', ''),
     }
     
-    # Convertir año a int
     if result['año']:
         try:
             result['año'] = int(result['año'])
@@ -688,26 +627,23 @@ async def fetch_vehicle_details(
                         else:
                             result[field] = value
             
-            # Actualizar modelo
             if result.get('marca'):
                 result['modelo'] = extract_modelo_from_titulo(titulo, result['marca'])
         except Exception as e:
             if DEBUG_MODE:
                 logger.debug(f"Error extrayendo detalles de {url}: {e}")
     
-    # Parsear precio
     precio_text = vehicle_basic.get('precio_text', '')
     result.update(parse_precio(precio_text, dolar_mep))
     
     return result
 
-
 async def fetch_all_details(
-    http: FastHTTPClient, 
-    vehicles: List[Dict], 
+    http: FastHTTPClient,
+    vehicles: List[Dict],
     dolar_mep: float
 ) -> List[Dict]:
-    """Obtiene todos los detalles en paralelo - OPTIMIZADO."""
+    """Obtiene todos los detalles en paralelo."""
     total = len(vehicles)
     logger.info(f"🚗 Worker {WORKER_ID}: Obteniendo detalles de {total} vehículos...")
     
@@ -717,7 +653,6 @@ async def fetch_all_details(
     for i in range(0, total, batch_size):
         batch = vehicles[i:i + batch_size]
         
-        # Lanzar todas las requests del batch en paralelo
         tasks = [fetch_vehicle_details(http, v, dolar_mep) for v in batch]
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -730,37 +665,26 @@ async def fetch_all_details(
         
         processed = min(i + batch_size, total)
         pct = (processed / total) * 100
-        
         logger.info(
             f"  Procesados: {processed}/{total} ({pct:.0f}%) | "
-            f"Válidos: {len(results)} | {STATS.rps():.1f} req/s | "
-            f"Errores: {STATS.requests_failed}"
+            f"Válidos: {len(results)} | {STATS.rps():.1f} req/s"
         )
         
         if CONFIG.delay_between_batches > 0:
             await asyncio.sleep(CONFIG.delay_between_batches)
     
     if not results:
-        fatal_error(
-            f"Worker {WORKER_ID}: No se pudo procesar ningún vehículo. "
-            "Todos los detalles fallaron."
-        )
+        fatal_error(f"Worker {WORKER_ID}: No se pudo procesar ningún vehículo")
     
-    # Advertencia si hay muchos fallos
     success_pct = (len(results) / total) * 100
     if success_pct < 90:
-        logger.warning(
-            f"⚠️ Solo se procesaron {len(results)}/{total} vehículos ({success_pct:.1f}%). "
-            f"Algunos detalles pueden faltar."
-        )
+        logger.warning(f"⚠️ Solo {len(results)}/{total} vehículos ({success_pct:.1f}%)")
     
     return results
 
-
 # ═══════════════════════════════════════════════════════════════
-# 💾 GUARDAR DATOS DEL WORKER - SIN CAMBIOS
+# 💾 GUARDAR DATOS DEL WORKER
 # ═══════════════════════════════════════════════════════════════
-
 async def save_worker_results(results: List[Dict], dolar_mep: float):
     """Guarda los resultados del worker en su base de datos."""
     today = date.today().isoformat()
@@ -769,7 +693,6 @@ async def save_worker_results(results: List[Dict], dolar_mep: float):
         await init_worker_db(WORKER_DB)
         
         async with aiosqlite.connect(WORKER_DB) as db:
-            # Guardar metadatos
             await db.execute(
                 "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
                 ('scrape_date', today)
@@ -782,8 +705,15 @@ async def save_worker_results(results: List[Dict], dolar_mep: float):
                 "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
                 ('rate_limits_429', str(STATS.requests_429))
             )
+            await db.execute(
+                "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
+                ('worker_id', str(WORKER_ID))
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
+                ('vehicles_count', str(len(results)))
+            )
             
-            # Insertar vehículos
             for vehicle in results:
                 await db.execute("""
                     INSERT OR REPLACE INTO vehicles (
@@ -792,35 +722,25 @@ async def save_worker_results(results: List[Dict], dolar_mep: float):
                         precio_ars, precio_usd, primera_vista, ultima_vista, activo
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """, (
-                    vehicle['id'],
-                    vehicle['url'],
-                    vehicle.get('marca'),
-                    vehicle.get('modelo'),
-                    vehicle.get('version'),
-                    vehicle.get('año'),
-                    vehicle.get('kilometros'),
-                    vehicle.get('transmision'),
-                    vehicle.get('combustible'),
-                    vehicle.get('vendedor'),
-                    vehicle.get('agencia'),
-                    vehicle.get('imagen'),
-                    vehicle.get('precio_ars'),
-                    vehicle.get('precio_usd'),
-                    today,
-                    today,
+                    vehicle['id'], vehicle['url'], vehicle.get('marca'),
+                    vehicle.get('modelo'), vehicle.get('version'),
+                    vehicle.get('año'), vehicle.get('kilometros'),
+                    vehicle.get('transmision'), vehicle.get('combustible'),
+                    vehicle.get('vendedor'), vehicle.get('agencia'),
+                    vehicle.get('imagen'), vehicle.get('precio_ars'),
+                    vehicle.get('precio_usd'), today, today,
                 ))
             
             await db.commit()
         
         logger.info(f"✅ Worker {WORKER_ID}: Guardados {len(results)} vehículos en {WORKER_DB}")
+        
     except Exception as e:
         fatal_error(f"Error guardando resultados del worker {WORKER_ID}", e)
 
-
 # ═══════════════════════════════════════════════════════════════
-# 🔄 CONSOLIDACIÓN DE WORKERS - SIN CAMBIOS
+# 🔄 CONSOLIDACIÓN DE WORKERS
 # ═══════════════════════════════════════════════════════════════
-
 def consolidate_worker_results():
     """Consolida los resultados de todos los workers."""
     logger.info("=" * 60)
@@ -830,52 +750,75 @@ def consolidate_worker_results():
     try:
         today = date.today().isoformat()
         
+        # Buscar todos los workers disponibles
+        available_workers = find_worker_databases()
+        
+        logger.info(f"\n📂 Buscando bases de datos de workers...")
+        for worker_id, db_path in available_workers:
+            size = os.path.getsize(db_path)
+            logger.info(f"   ✅ Worker {worker_id}: {db_path} ({size:,} bytes)")
+        
+        if not available_workers:
+            # Listar archivos para debug
+            logger.error("❌ No se encontraron bases de datos de workers")
+            logger.error("Archivos en directorio actual:")
+            for f in os.listdir('.'):
+                logger.error(f"   - {f}")
+            fatal_error("No hay bases de datos de workers para consolidar")
+        
+        logger.info(f"\n📊 Workers encontrados: {len(available_workers)}/{TOTAL_WORKERS}")
+        
+        if len(available_workers) < TOTAL_WORKERS * 0.5:
+            logger.warning(f"⚠️ Solo {len(available_workers)}/{TOTAL_WORKERS} workers (<50%)")
+        
+        # Inicializar BD maestra
         master_exists = os.path.exists(MASTER_DB)
-        if not master_exists:
-            logger.info("📂 Creando nueva base de datos maestra...")
+        if master_exists:
+            logger.info(f"📂 BD maestra existente encontrada")
         else:
-            logger.info("📂 Usando base de datos maestra existente...")
+            logger.info(f"📂 Creando nueva BD maestra...")
         
         init_master_db(MASTER_DB)
-        
         conn = sqlite3.connect(MASTER_DB)
         conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
         
-        # Obtener dólar
+        # Obtener dólar del primer worker disponible
         dolar_mep = None
         total_rate_limits = 0
         
-        for worker_id in range(TOTAL_WORKERS):
-            worker_db = f'{WORKER_DB_PREFIX}{worker_id}.db'
-            if os.path.exists(worker_db):
-                try:
-                    worker_conn = sqlite3.connect(worker_db)
-                    result = worker_conn.execute(
-                        "SELECT value FROM scrape_metadata WHERE key = 'dolar_mep'"
-                    ).fetchone()
-                    if result:
-                        dolar_mep = float(result[0])
-                    
-                    # Sumar rate limits
-                    rl_result = worker_conn.execute(
-                        "SELECT value FROM scrape_metadata WHERE key = 'rate_limits_429'"
-                    ).fetchone()
-                    if rl_result:
-                        total_rate_limits += int(rl_result[0])
-                    
+        for worker_id, db_path in available_workers:
+            try:
+                worker_conn = sqlite3.connect(db_path)
+                
+                # Verificar integridad
+                integrity = worker_conn.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != 'ok':
+                    logger.error(f"❌ Worker {worker_id}: BD corrupta")
                     worker_conn.close()
-                    
-                    if dolar_mep:
-                        break
-                except Exception as e:
-                    logger.warning(f"Error leyendo metadata de worker {worker_id}: {e}")
+                    continue
+                
+                result = worker_conn.execute(
+                    "SELECT value FROM scrape_metadata WHERE key = 'dolar_mep'"
+                ).fetchone()
+                if result and not dolar_mep:
+                    dolar_mep = float(result[0])
+                
+                rl = worker_conn.execute(
+                    "SELECT value FROM scrape_metadata WHERE key = 'rate_limits_429'"
+                ).fetchone()
+                if rl:
+                    total_rate_limits += int(rl[0])
+                
+                worker_conn.close()
+            except Exception as e:
+                logger.error(f"Error leyendo worker {worker_id}: {e}")
         
         if not dolar_mep:
             conn.close()
             fatal_error("No se encontró cotización del dólar en ningún worker")
         
-        logger.info(f"💵 Dólar: ${dolar_mep:.2f}")
+        logger.info(f"\n💵 Dólar MEP: ${dolar_mep:.2f}")
         if total_rate_limits > 0:
             logger.info(f"⚠️ Rate limits totales: {total_rate_limits}")
         
@@ -892,26 +835,28 @@ def consolidate_worker_results():
             "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
             ('rate_limits_429', str(total_rate_limits))
         )
+        cursor.execute(
+            "INSERT OR REPLACE INTO scrape_metadata (key, value) VALUES (?, ?)",
+            ('workers_consolidated', str(len(available_workers)))
+        )
         
         seen_ids_today = set()
         total_from_workers = 0
         
         # Procesar cada worker
-        for worker_id in range(TOTAL_WORKERS):
-            worker_db = f'{WORKER_DB_PREFIX}{worker_id}.db'
-            
-            if not os.path.exists(worker_db):
-                logger.warning(f"  ⚠️ Worker {worker_id}: No se encontró {worker_db}")
-                continue
-            
-            logger.info(f"  📥 Procesando Worker {worker_id}...")
+        for worker_id, db_path in available_workers:
+            logger.info(f"\n📥 Procesando Worker {worker_id} ({db_path})...")
             
             try:
-                cursor.execute(f"ATTACH DATABASE '{worker_db}' AS worker")
+                cursor.execute(f"ATTACH DATABASE '{db_path}' AS worker")
                 
                 count = cursor.execute("SELECT COUNT(*) FROM worker.vehicles").fetchone()[0]
                 total_from_workers += count
-                logger.info(f"     Vehículos: {count}")
+                logger.info(f"   Vehículos: {count}")
+                
+                if count == 0:
+                    cursor.execute("DETACH DATABASE worker")
+                    continue
                 
                 worker_vehicles = cursor.execute("""
                     SELECT id, url, marca, modelo, version, año, kilometros,
@@ -933,103 +878,97 @@ def consolidate_worker_results():
                     
                     if existing:
                         old_precio_usd = existing[0]
-                        primera_vista = existing[1]
                         
                         cursor.execute("""
                             UPDATE vehicles SET
                                 url = ?, marca = ?, modelo = ?, version = ?, año = ?,
                                 kilometros = ?, transmision = ?, combustible = ?,
-                                vendedor = ?, agencia = ?, imagen = ?,
-                                precio_ars = ?, precio_usd = ?,
-                                ultima_vista = ?, activo = 1,
+                                vendedor = ?, agencia = ?, imagen = ?, precio_ars = ?,
+                                precio_usd = ?, ultima_vista = ?, activo = 1,
                                 dias_publicado = julianday(?) - julianday(primera_vista)
                             WHERE id = ?
                         """, (
                             v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
                             v[9], v[10], v[11], v[12], v[13], today, today, vehicle_id
                         ))
-                        
                         STATS.vehicles_updated += 1
                         
-                        # Registrar cambio de precio
                         if old_precio_usd and new_precio_usd and abs(old_precio_usd - new_precio_usd) > 0.01:
                             variacion = ((new_precio_usd - old_precio_usd) / old_precio_usd) * 100
-                            
                             cursor.execute("""
-                                INSERT INTO price_history (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
+                                INSERT INTO price_history
+                                (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
                                 VALUES (?, ?, ?, ?, ?)
                             """, (vehicle_id, v[12], new_precio_usd, today, round(variacion, 2)))
-                            
                             STATS.vehicles_price_changed += 1
-                    
                     else:
-                        # Nuevo vehículo
                         cursor.execute("""
                             INSERT INTO vehicles (
                                 id, url, marca, modelo, version, año, kilometros,
                                 transmision, combustible, vendedor, agencia, imagen,
-                                precio_ars, precio_usd, primera_vista, ultima_vista, activo, dias_publicado
+                                precio_ars, precio_usd, primera_vista, ultima_vista,
+                                activo, dias_publicado
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
                         """, (
                             v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
                             v[8], v[9], v[10], v[11], v[12], v[13], today, today
                         ))
                         
-                        # Precio inicial
                         if new_precio_usd:
                             cursor.execute("""
-                                INSERT INTO price_history (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
+                                INSERT INTO price_history
+                                (vehicle_id, precio_ars, precio_usd, fecha, variacion_pct)
                                 VALUES (?, ?, ?, ?, NULL)
                             """, (vehicle_id, v[12], new_precio_usd, today))
                         
                         STATS.vehicles_new += 1
                 
                 cursor.execute("DETACH DATABASE worker")
-            
+                logger.info(f"   ✅ Procesado correctamente")
+                
             except Exception as e:
-                logger.error(f"Error procesando worker {worker_id}: {e}")
+                logger.error(f"❌ Error en worker {worker_id}: {e}")
+                if DEBUG_MODE:
+                    import traceback
+                    traceback.print_exc()
                 try:
                     cursor.execute("DETACH DATABASE worker")
                 except:
                     pass
-                continue
         
         logger.info(f"\n📊 Total vehículos de workers: {total_from_workers}")
         logger.info(f"   IDs únicos vistos hoy: {len(seen_ids_today)}")
+        
+        if not seen_ids_today:
+            conn.close()
+            fatal_error("No se procesó ningún vehículo")
         
         # Marcar inactivos
         newly_inactive = 0
         if seen_ids_today:
             placeholders = ','.join('?' * len(seen_ids_today))
             result = cursor.execute(f"""
-                UPDATE vehicles 
-                SET activo = 0
-                WHERE activo = 1 
-                AND id NOT IN ({placeholders})
+                UPDATE vehicles SET activo = 0
+                WHERE activo = 1 AND id NOT IN ({placeholders})
             """, tuple(seen_ids_today))
             newly_inactive = result.rowcount
-            logger.info(f"   🔴 Marcados como inactivos: {newly_inactive}")
+            logger.info(f"   🔴 Marcados inactivos: {newly_inactive}")
         
-        # Purgar >90 días
+        # Purgar antiguos
         cursor.execute("""
-            DELETE FROM price_history 
-            WHERE vehicle_id IN (
-                SELECT id FROM vehicles 
-                WHERE activo = 0 
-                AND ultima_vista < date('now', '-90 days')
+            DELETE FROM price_history WHERE vehicle_id IN (
+                SELECT id FROM vehicles
+                WHERE activo = 0 AND ultima_vista < date('now', '-90 days')
             )
         """)
-        purged_history = cursor.rowcount
         
         cursor.execute("""
-            DELETE FROM vehicles 
-            WHERE activo = 0 
-            AND ultima_vista < date('now', '-90 days')
+            DELETE FROM vehicles
+            WHERE activo = 0 AND ultima_vista < date('now', '-90 days')
         """)
-        purged_vehicles = cursor.rowcount
-        
-        if purged_vehicles > 0:
-            logger.info(f"   🗑️ Purgados (>90 días): {purged_vehicles} vehículos, {purged_history} registros")
+        purged = cursor.rowcount
+        if purged > 0:
+            logger.info(f"   🗑️ Purgados (>90 días): {purged}")
         
         # Estadísticas finales
         total_active = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
@@ -1040,55 +979,52 @@ def consolidate_worker_results():
         conn.close()
         
         # Eliminar DBs de workers
-        for worker_id in range(TOTAL_WORKERS):
-            worker_db = f'{WORKER_DB_PREFIX}{worker_id}.db'
-            if os.path.exists(worker_db):
-                os.remove(worker_db)
-                logger.info(f"   🗑️ Eliminado {worker_db}")
+        for worker_id, db_path in available_workers:
+            try:
+                os.remove(db_path)
+                logger.info(f"   🗑️ Eliminado {db_path}")
+            except:
+                pass
         
         db_size = os.path.getsize(MASTER_DB) / 1024 / 1024
         
         logger.info("\n" + "=" * 60)
         logger.info("✅ CONSOLIDACIÓN COMPLETADA")
         logger.info("=" * 60)
+        logger.info(f"   👷 Workers procesados: {len(available_workers)}/{TOTAL_WORKERS}")
         logger.info(f"   🆕 Nuevos: {STATS.vehicles_new}")
         logger.info(f"   🔄 Actualizados: {STATS.vehicles_updated}")
-        logger.info(f"   💰 Cambios de precio: {STATS.vehicles_price_changed}")
+        logger.info(f"   💰 Cambios precio: {STATS.vehicles_price_changed}")
         logger.info(f"   🔴 Nuevos inactivos: {newly_inactive}")
         logger.info(f"   📊 Total activos: {total_active}")
         logger.info(f"   📴 Total inactivos: {total_inactive}")
-        logger.info(f"   📈 Registros historial: {total_history}")
+        logger.info(f"   📈 Historial: {total_history}")
         logger.info(f"   💾 Tamaño BD: {db_size:.2f} MB")
         logger.info("=" * 60)
-    
+        
     except Exception as e:
         fatal_error("Error durante consolidación", e)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 🚀 FUNCIÓN PRINCIPAL DEL WORKER
 # ═══════════════════════════════════════════════════════════════
-
 async def run_worker():
     """Ejecuta el worker de scraping."""
     global STATS
     STATS = Stats()
-    
     start_time = datetime.now()
+    
     start_page, end_page = calculate_page_range()
     
     logger.info("=" * 60)
     logger.info(f"🚀 WORKER {WORKER_ID}/{TOTAL_WORKERS} INICIANDO")
-    logger.info(f"   Páginas asignadas: {start_page} - {end_page}")
-    logger.info(f"   Concurrencia listados: {CONFIG.max_concurrent_listings}")
-    logger.info(f"   Concurrencia detalles: {CONFIG.max_concurrent_details}")
-    logger.info(f"   HTTP/2: Habilitado")
+    logger.info(f"   Páginas: {start_page} - {end_page}")
     logger.info("=" * 60)
     
     try:
         async with FastHTTPClient() as http:
             # 1. Dólar
-            logger.info("📊 Obteniendo cotización del dólar...")
+            logger.info("\n📊 Obteniendo cotización del dólar...")
             dolar_mep = await get_dolar_from_api()
             
             # 2. Listados
@@ -1103,28 +1039,25 @@ async def run_worker():
             # 4. Guardar
             logger.info("\n💾 Guardando resultados...")
             await save_worker_results(results, dolar_mep)
-            
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
-            logger.info("\n" + "=" * 60)
-            logger.info(f"✅ WORKER {WORKER_ID} COMPLETADO")
-            logger.info("=" * 60)
-            logger.info(f"   ⏱️ Tiempo: {elapsed:.1f}s ({elapsed/60:.1f} min)")
-            logger.info(f"   📊 Requests: {STATS.requests_made} ({STATS.rps():.1f} req/s)")
-            logger.info(f"   ✅ Exitosos: {STATS.requests_success}")
-            logger.info(f"   ❌ Fallidos: {STATS.requests_failed}")
-            logger.info(f"   ⚠️ Rate limits: {STATS.requests_429}")
-            logger.info(f"   🚗 Vehículos procesados: {len(results)}")
-            logger.info("=" * 60)
-    
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        logger.info("\n" + "=" * 60)
+        logger.info(f"✅ WORKER {WORKER_ID} COMPLETADO")
+        logger.info("=" * 60)
+        logger.info(f"   ⏱️ Tiempo: {elapsed:.1f}s")
+        logger.info(f"   📊 Requests: {STATS.requests_made}")
+        logger.info(f"   ✅ Exitosos: {STATS.requests_success}")
+        logger.info(f"   ❌ Fallidos: {STATS.requests_failed}")
+        logger.info(f"   🚗 Vehículos: {len(results)}")
+        logger.info("=" * 60)
+        
     except Exception as e:
         fatal_error(f"Error en worker {WORKER_ID}", e)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 🎯 PUNTO DE ENTRADA
 # ═══════════════════════════════════════════════════════════════
-
 def main():
     """Punto de entrada principal."""
     try:
@@ -1133,13 +1066,12 @@ def main():
         else:
             asyncio.run(run_worker())
     except KeyboardInterrupt:
-        logger.warning("⚠️ Interrumpido por el usuario")
+        logger.warning("⚠️ Interrumpido")
         sys.exit(1)
     except SystemExit:
         raise
     except Exception as e:
-        fatal_error("Error no manejado en main", e)
-
+        fatal_error("Error no manejado", e)
 
 if __name__ == "__main__":
     main()
