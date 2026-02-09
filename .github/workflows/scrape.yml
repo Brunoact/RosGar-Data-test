@@ -134,17 +134,21 @@ jobs:
         run: |
           echo "=== Estructura de worker_downloads ==="
           find ./worker_downloads -type f -name "*.db" -ls || echo "No hay archivos .db"
+          
           echo ""
           echo "=== Moviendo archivos al directorio raíz ==="
           find ./worker_downloads -type f -name "rosariogarage_worker_*.db" -exec mv {} . \;
+          
           echo ""
           echo "=== Archivos .db en directorio actual ==="
           ls -lh *.db 2>/dev/null || echo "No hay archivos .db"
+          
           echo ""
           echo "=== Verificación detallada de workers ==="
           FOUND=0
           MISSING=0
           TOTAL_VEHICLES=0
+          
           for i in {0..7}; do
             DB_FILE="rosariogarage_worker_${i}.db"
             if [ -f "$DB_FILE" ]; then
@@ -158,6 +162,7 @@ jobs:
               MISSING=$((MISSING + 1))
             fi
           done
+          
           echo ""
           echo "════════════════════════════════════════"
           echo "📊 RESUMEN: ${FOUND}/8 workers encontrados"
@@ -213,7 +218,7 @@ jobs:
               print(f"   └─ Inactivos:    {format_number(inactivos)}")
               print()
               
-              # Normalización
+              # Normalización (CORREGIDO: usar norm_status en lugar de normalizacion)
               normalizados = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE norm_status = 'full_match' AND activo = 1"
               ).fetchone()[0]
@@ -221,7 +226,7 @@ jobs:
                   "SELECT COUNT(*) FROM vehicles WHERE norm_status = 'partial_match' AND activo = 1"
               ).fetchone()[0]
               no_match = conn.execute(
-                  "SELECT COUNT(*) FROM vehicles WHERE norm_status IN ('marca_only', 'no_match') AND activo = 1"
+                  "SELECT COUNT(*) FROM vehicles WHERE norm_status IN ('marca_only', 'no_match', 'raw', 'pending') AND activo = 1"
               ).fetchone()[0]
               
               print(f"🔧 NORMALIZACIÓN (activos)")
@@ -257,9 +262,7 @@ jobs:
                       AVG(precio_usd) as avg_precio,
                       COUNT(*) as count
                   FROM vehicles 
-                  WHERE activo = 1 
-                    AND precio_usd IS NOT NULL 
-                    AND precio_usd > 0
+                  WHERE activo = 1 AND precio_usd IS NOT NULL AND precio_usd > 0
               """).fetchone()
               
               if precio_stats[3] > 0:
@@ -269,20 +272,38 @@ jobs:
                   print(f"   Promedio:        ${format_number(int(precio_stats[2]))}")
                   print()
               
-              # Top marcas normalizadas
-              print(f"🏭 TOP 10 MARCAS NORMALIZADAS (Activos)")
+              # Top marcas (CORREGIDO: usar 'marca' en lugar de 'marca_norm')
+              print(f"🏭 TOP 10 MARCAS (Activos)")
               for marca, count in conn.execute("""
-                  SELECT marca_norm, COUNT(*) as c 
-                  FROM vehicles 
-                  WHERE activo = 1 
-                    AND marca_norm IS NOT NULL 
-                    AND marca_norm != ''
-                  GROUP BY marca_norm 
-                  ORDER BY c DESC 
+                  SELECT marca, COUNT(*) as c 
+                  FROM vehicles
+                  WHERE activo = 1 AND marca IS NOT NULL AND marca != ''
+                  GROUP BY marca
+                  ORDER BY c DESC
                   LIMIT 10
               """):
                   bar = '█' * min(30, max(1, int(count * 30 / max(activos, 1))))
                   print(f"   {marca:15s} {count:5} {bar}")
+              print()
+              
+              # Vendedores particulares vs agencias
+              particulares = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND es_particular = 1"
+              ).fetchone()[0]
+              agencias = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND es_particular = 0"
+              ).fetchone()[0]
+              
+              print(f"👤 TIPO DE VENDEDOR (Activos)")
+              print(f"   Particulares:    {format_number(particulares)}")
+              print(f"   Agencias:        {format_number(agencias)}")
+              print()
+              
+              # Vehículos con urgencia
+              con_urgencia = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND tiene_urgencia = 1"
+              ).fetchone()[0]
+              print(f"🔥 Con señales de urgencia: {format_number(con_urgencia)}")
               print()
               
               # Metadata
@@ -292,13 +313,24 @@ jobs:
               
               if 'last_dolar_mep' in metadata:
                   print(f"💵 Dólar MEP: ${float(metadata['last_dolar_mep']):.2f}")
+              
               if 'workers_consolidated' in metadata:
                   print(f"👷 Workers consolidados: {metadata['workers_consolidated']}")
+              
               if 'rate_limits_429' in metadata and int(metadata.get('rate_limits_429', 0)) > 0:
                   print(f"⚠️ Rate limits detectados: {metadata['rate_limits_429']}")
               
               total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
               print(f"📜 Registros de historial: {format_number(total_history)}")
+              
+              # Re-publicaciones detectadas
+              try:
+                  repubs = conn.execute("SELECT COUNT(*) FROM republication_log").fetchone()[0]
+                  if repubs > 0:
+                      print(f"🔁 Re-publicaciones detectadas: {format_number(repubs)}")
+              except:
+                  pass
+              
               print("=" * 60)
               
               # Generar JSON para GitHub Summary
@@ -310,6 +342,9 @@ jobs:
                   "cambios_precio": cambios_precio_hoy,
                   "normalizados": normalizados,
                   "parciales": parciales,
+                  "particulares": particulares,
+                  "agencias": agencias,
+                  "con_urgencia": con_urgencia,
                   "dolar_mep": float(metadata.get('last_dolar_mep', 0)),
                   "workers": int(metadata.get('workers_consolidated', 0))
               }
@@ -358,6 +393,9 @@ jobs:
             CAMBIOS=$(jq -r '.cambios_precio' summary.json)
             NORMALIZADOS=$(jq -r '.normalizados' summary.json)
             PARCIALES=$(jq -r '.parciales' summary.json)
+            PARTICULARES=$(jq -r '.particulares' summary.json)
+            AGENCIAS=$(jq -r '.agencias' summary.json)
+            URGENCIA=$(jq -r '.con_urgencia' summary.json)
             DOLAR=$(jq -r '.dolar_mep' summary.json)
             WORKERS=$(jq -r '.workers' summary.json)
           else
@@ -367,6 +405,9 @@ jobs:
             CAMBIOS="Error"
             NORMALIZADOS="Error"
             PARCIALES="Error"
+            PARTICULARES="Error"
+            AGENCIAS="Error"
+            URGENCIA="Error"
             DOLAR="Error"
             WORKERS="Error"
           fi
@@ -393,6 +434,14 @@ jobs:
           |--------|----------|
           | ✅ Completa (marca+modelo+versión) | **${NORMALIZADOS}** |
           | 🟡 Parcial (marca+modelo) | **${PARCIALES}** |
+          
+          ## 👤 Vendedores
+          
+          | Tipo | Cantidad |
+          |------|----------|
+          | 👤 Particulares | **${PARTICULARES}** |
+          | 🏢 Agencias | **${AGENCIAS}** |
+          | 🔥 Con urgencia | **${URGENCIA}** |
           
           ## 📥 Descarga
           
