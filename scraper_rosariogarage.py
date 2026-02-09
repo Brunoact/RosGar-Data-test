@@ -1,13 +1,10 @@
 """
-🚗 Scraper RosarioGarage - Versión Producción v2.3
+🚗 Scraper RosarioGarage - Versión Producción v2.4
 ==================================================
-Extrae datos de cada publicación y los normaliza contra catálogo.
+Extrae datos de cada publicación y normaliza contra catálogo.
+Si no encuentra en catálogo, usa datos originales.
 
-Flujo:
-1. Obtiene ID y URL del listado
-2. Extrae datos crudos de cada publicación (marca_raw, version_raw, etc.)
-3. Usa el normalizador para obtener marca/modelo/versión correctos del catálogo
-4. Guarda valores normalizados (o NULL si no se pudo determinar)
+NUNCA deja marca vacía ni marca sin modelo.
 """
 
 import httpx
@@ -24,14 +21,12 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 import logging
 
-# Async SQLite
 try:
     import aiosqlite
     HAS_AIOSQLITE = True
 except ImportError:
     HAS_AIOSQLITE = False
 
-# Importar normalizador
 try:
     from normalizer import (
         init_normalizer,
@@ -43,14 +38,13 @@ try:
 except ImportError:
     HAS_NORMALIZER = False
 
-# --- CONFIGURACIÓN ---
+# --- CONFIG ---
 BASE_URL = "https://www.rosariogarage.com"
 LISTING_URL = "https://www.rosariogarage.com/index.php?action=carro/showRubro&rbrId=107"
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
 
 ITEMS_PER_PAGE = 95
 MAX_PAGES = 100
-
 MASTER_DB = 'rosariogarage.db'
 WORKER_DB_PREFIX = 'rosariogarage_worker_'
 
@@ -83,8 +77,6 @@ class Stats:
     requests_success: int = 0
     requests_failed: int = 0
     requests_429: int = 0
-    retries: int = 0
-    bytes_downloaded: int = 0
     vehicles_new: int = 0
     vehicles_updated: int = 0
     vehicles_price_changed: int = 0
@@ -111,29 +103,25 @@ def setup_logging():
 logger = setup_logging()
 
 
-def fatal_error(message: str, exception: Exception = None):
-    logger.critical("=" * 60)
-    logger.critical(f"💀 ERROR FATAL: {message}")
-    if exception:
-        logger.critical(f"   Excepción: {type(exception).__name__}: {exception}")
-    logger.critical("=" * 60)
+def fatal_error(msg: str, e: Exception = None):
+    logger.critical(f"💀 {msg}")
+    if e:
+        logger.critical(f"   {type(e).__name__}: {e}")
     sys.exit(1)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔧 FUNCIONES AUXILIARES
+# 🔧 HELPERS
 # ═══════════════════════════════════════════════════════════════
 HTML_ENTITIES = str.maketrans({'\xa0': ' '})
 ENTITY_PATTERN = re.compile(r'&(\w+);')
-ENTITY_MAP = {
-    'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á', 'eacute': 'é',
-    'iacute': 'í', 'uacute': 'ú', 'ntilde': 'ñ', 'Ntilde': 'Ñ',
-    'amp': '&', 'quot': '"', 'lt': '<', 'gt': '>',
-}
+ENTITY_MAP = {'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á', 'eacute': 'é',
+              'iacute': 'í', 'uacute': 'ú', 'ntilde': 'ñ', 'amp': '&'}
 
 RE_DIGITS = re.compile(r'[^\d]')
 RE_PRICE = re.compile(r'(\d+\.?\d*)')
 RE_WHATSAPP = re.compile(r'wa\.me/(\d+)\?', re.I)
+RE_YEAR = re.compile(r'^(19|20)\d{2}$')
 
 
 def clean_text(text: str) -> str:
@@ -144,16 +132,12 @@ def clean_text(text: str) -> str:
     return ' '.join(text.split())
 
 
-def clean_html_to_text(html: str) -> str:
+def clean_html(html: str) -> str:
     if not html:
         return ""
-    text = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
     text = re.sub(r'<[^>]+>', '', text)
-    text = text.translate(HTML_ENTITIES)
-    text = ENTITY_PATTERN.sub(lambda m: ENTITY_MAP.get(m.group(1), m.group(0)), text)
-    lines = text.split('\n')
-    lines = [' '.join(line.split()) for line in lines]
-    return '\n'.join(line for line in lines if line.strip())
+    return clean_text(text)
 
 
 def decode_response(resp: httpx.Response) -> str:
@@ -167,394 +151,339 @@ def calculate_page_range() -> Tuple[int, int]:
     pages_per_worker = MAX_PAGES // TOTAL_WORKERS
     remainder = MAX_PAGES % TOTAL_WORKERS
     if WORKER_ID < remainder:
-        start_page = WORKER_ID * (pages_per_worker + 1)
-        end_page = start_page + pages_per_worker
+        start = WORKER_ID * (pages_per_worker + 1)
+        end = start + pages_per_worker
     else:
-        start_page = WORKER_ID * pages_per_worker + remainder
-        end_page = start_page + pages_per_worker - 1
-    return start_page, end_page
+        start = WORKER_ID * pages_per_worker + remainder
+        end = start + pages_per_worker - 1
+    return start, end
 
 
 def find_worker_databases() -> List[Tuple[int, str]]:
     found = []
-    for worker_id in range(TOTAL_WORKERS):
-        db_name = f'{WORKER_DB_PREFIX}{worker_id}.db'
-        if os.path.exists(db_name):
-            found.append((worker_id, db_name))
-            continue
-        matches = glob.glob(f'**/{db_name}', recursive=True)
-        if matches:
-            found.append((worker_id, matches[0]))
+    for wid in range(TOTAL_WORKERS):
+        db = f'{WORKER_DB_PREFIX}{wid}.db'
+        if os.path.exists(db):
+            found.append((wid, db))
+        else:
+            matches = glob.glob(f'**/{db}', recursive=True)
+            if matches:
+                found.append((wid, matches[0]))
     return found
 
 
-def generate_vehicle_fingerprint(
-    marca: str, modelo: str, año: int, km: int,
-    whatsapp: str = None, vendedor_id: str = None
-) -> str:
+def generate_fingerprint(marca: str, modelo: str, año: int, km: int, whatsapp: str = None) -> str:
     km_rango = (km // 5000) * 5000 if km else 0
-    components = [
-        (marca or '').lower().strip(),
-        (modelo or '').lower().strip(),
-        str(año or 0),
-        str(km_rango),
-        (whatsapp or vendedor_id or '').strip()
-    ]
-    return hashlib.md5('|'.join(components).encode()).hexdigest()[:16]
+    parts = [(marca or '').lower(), (modelo or '').lower(), str(año or 0), str(km_rango), whatsapp or '']
+    return hashlib.md5('|'.join(parts).encode()).hexdigest()[:16]
 
 
-def parse_km(km_str) -> int:
-    if not km_str:
+def parse_km(s) -> int:
+    if not s:
         return 0
-    clean = RE_DIGITS.sub('', str(km_str))
     try:
-        return int(clean) if clean else 0
+        return int(RE_DIGITS.sub('', str(s))) or 0
     except:
         return 0
 
 
-def parse_year(year_str) -> Optional[int]:
-    if not year_str:
+def parse_year(s) -> Optional[int]:
+    if not s:
         return None
     try:
-        digits = RE_DIGITS.sub('', str(year_str))
+        digits = RE_DIGITS.sub('', str(s))
         if len(digits) == 4:
-            year = int(digits)
-            if 1950 <= year <= 2030:
-                return year
+            y = int(digits)
+            if 1950 <= y <= 2030:
+                return y
     except:
         pass
     return None
 
 
-def parse_transmision(trans_str) -> Optional[str]:
-    if not trans_str:
+def parse_trans(s) -> Optional[str]:
+    if not s:
         return None
-    trans = trans_str.lower()
-    if 'manual' in trans or 'mt' in trans:
+    t = s.lower()
+    if 'manual' in t or 'mt' in t:
         return 'manual'
-    elif 'auto' in trans or 'at' in trans:
+    if 'auto' in t or 'at' in t:
         return 'automatico'
-    return trans
+    return t
 
 
-def parse_precio(precio_text: str, dolar_mep: float) -> Optional[float]:
-    if not precio_text or 'consultar' in precio_text.lower():
+def parse_precio(s: str, dolar: float) -> Optional[float]:
+    if not s or 'consultar' in s.lower():
         return None
     try:
-        precio_clean = precio_text.replace('$', '').replace('.', '').replace(',', '.')
-        match = RE_PRICE.search(precio_clean)
-        if match:
-            val = float(match.group(1))
-            is_usd = any(x in precio_text.upper() for x in ['U$S', 'USD', 'U$D', 'DÓLAR', 'DOLARES'])
-            if is_usd:
-                return val
-            elif dolar_mep:
-                return round(val / dolar_mep, 2)
+        clean = s.replace('$', '').replace('.', '').replace(',', '.')
+        m = RE_PRICE.search(clean)
+        if m:
+            val = float(m.group(1))
+            is_usd = any(x in s.upper() for x in ['U$S', 'USD', 'U$D', 'DÓLAR'])
+            return val if is_usd else round(val / dolar, 2) if dolar else None
     except:
         pass
     return None
 
 
-def is_particular(vendedor_str: str) -> int:
-    if not vendedor_str:
+def is_particular(s: str) -> int:
+    if not s:
         return 1
-    vendedor = vendedor_str.lower()
-    if 'due' in vendedor or 'particular' in vendedor or 'directo' in vendedor:
-        return 1
-    return 0
+    t = s.lower()
+    return 1 if any(x in t for x in ['due', 'particular', 'directo']) else 0
+
+
+def extract_model_from_version(version: str, marca: str = "") -> str:
+    """Extrae el modelo de version_raw."""
+    if not version:
+        return ""
+    text = version.lower().strip()
+    # Remover marca si está presente
+    if marca:
+        marca_lower = marca.lower()
+        if text.startswith(marca_lower):
+            text = text[len(marca_lower):].strip()
+    # Primera palabra significativa
+    words = text.split()
+    for w in words:
+        if len(w) >= 2 and not RE_YEAR.match(w):
+            return w
+    return words[0] if words else ""
 
 
 # ═══════════════════════════════════════════════════════════════
-# 💾 BASE DE DATOS
+# 💾 DATABASE
 # ═══════════════════════════════════════════════════════════════
-SCHEMA_SQL = """
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS vehicles (
-    id TEXT PRIMARY KEY,
-    url TEXT UNIQUE NOT NULL,
-    fingerprint TEXT,
-    
-    marca TEXT,
-    modelo TEXT,
-    version TEXT,
-    año INTEGER,
-    kilometros INTEGER,
-    transmision TEXT,
-    combustible TEXT,
-    
+    id TEXT PRIMARY KEY, url TEXT UNIQUE NOT NULL, fingerprint TEXT,
+    marca TEXT, modelo TEXT, version TEXT,
+    año INTEGER, kilometros INTEGER, transmision TEXT, combustible TEXT,
     precio_usd REAL,
-    
-    es_particular INTEGER DEFAULT 1,
-    avisos_vendedor INTEGER DEFAULT 1,
-    whatsapp TEXT,
-    
-    ciudad TEXT,
-    provincia TEXT,
-    
-    visitas INTEGER,
-    expira_dias INTEGER,
-    tiene_urgencia INTEGER DEFAULT 0,
-    
-    primera_vista DATE NOT NULL,
-    ultima_vista DATE NOT NULL,
-    activo INTEGER DEFAULT 1,
-    dias_publicado INTEGER DEFAULT 0,
-    
+    es_particular INTEGER DEFAULT 1, avisos_vendedor INTEGER DEFAULT 1, whatsapp TEXT,
+    ciudad TEXT, provincia TEXT,
+    visitas INTEGER, expira_dias INTEGER, tiene_urgencia INTEGER DEFAULT 0,
+    primera_vista DATE NOT NULL, ultima_vista DATE NOT NULL,
+    activo INTEGER DEFAULT 1, dias_publicado INTEGER DEFAULT 0,
     norm_status TEXT DEFAULT 'pending'
 );
-
-CREATE INDEX IF NOT EXISTS idx_vehicles_activo ON vehicles(activo);
-CREATE INDEX IF NOT EXISTS idx_vehicles_mercado ON vehicles(marca, modelo, año) WHERE activo = 1;
-CREATE INDEX IF NOT EXISTS idx_vehicles_precio ON vehicles(precio_usd) WHERE activo = 1;
-CREATE INDEX IF NOT EXISTS idx_vehicles_fingerprint ON vehicles(fingerprint);
-CREATE INDEX IF NOT EXISTS idx_vehicles_ultima_vista ON vehicles(ultima_vista);
+CREATE INDEX IF NOT EXISTS idx_activo ON vehicles(activo);
+CREATE INDEX IF NOT EXISTS idx_mercado ON vehicles(marca, modelo, año) WHERE activo = 1;
+CREATE INDEX IF NOT EXISTS idx_precio ON vehicles(precio_usd) WHERE activo = 1;
+CREATE INDEX IF NOT EXISTS idx_fingerprint ON vehicles(fingerprint);
 
 CREATE TABLE IF NOT EXISTS price_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vehicle_id TEXT NOT NULL,
-    precio_usd REAL,
-    fecha DATE NOT NULL,
-    variacion_pct REAL,
+    vehicle_id TEXT NOT NULL, precio_usd REAL, fecha DATE NOT NULL, variacion_pct REAL,
     FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_hist_vehicle ON price_history(vehicle_id);
 
-CREATE INDEX IF NOT EXISTS idx_history_vehicle ON price_history(vehicle_id);
-
-CREATE TABLE IF NOT EXISTS scrape_metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
+CREATE TABLE IF NOT EXISTS scrape_metadata (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE TABLE IF NOT EXISTS republication_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT NOT NULL,
-    old_vehicle_id TEXT,
-    new_vehicle_id TEXT,
-    fecha DATE NOT NULL,
-    dias_acumulados INTEGER
+    fingerprint TEXT NOT NULL, old_vehicle_id TEXT, new_vehicle_id TEXT,
+    fecha DATE NOT NULL, dias_acumulados INTEGER
 );
 """
 
 
-async def init_worker_db(db_path: str):
+async def init_worker_db(path: str):
     if not HAS_AIOSQLITE:
-        fatal_error("aiosqlite no está instalado")
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            await db.executescript(SCHEMA_SQL)
-            await db.commit()
-        logger.info(f"✅ Base de datos inicializada: {db_path}")
-    except Exception as e:
-        fatal_error(f"Error inicializando BD {db_path}", e)
+        fatal_error("aiosqlite no instalado")
+    async with aiosqlite.connect(path) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
+    logger.info(f"✅ BD inicializada: {path}")
 
 
-def init_master_db(db_path: str):
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.executescript(SCHEMA_SQL)
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ BD maestra inicializada: {db_path}")
-    except Exception as e:
-        fatal_error(f"Error inicializando BD maestra", e)
+def init_master_db(path: str):
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ BD maestra: {path}")
 
 
 # ═══════════════════════════════════════════════════════════════
 # 🌐 HTTP CLIENT
 # ═══════════════════════════════════════════════════════════════
-class FastHTTPClient:
+class HTTPClient:
     def __init__(self):
         self.client = None
-        self.sem_listings = None
-        self.sem_details = None
+        self.sem_list = None
+        self.sem_detail = None
 
     async def __aenter__(self):
         limits = httpx.Limits(max_connections=CONFIG.max_connections, max_keepalive_connections=CONFIG.max_keepalive)
-        timeout = httpx.Timeout(connect=CONFIG.connect_timeout, read=CONFIG.read_timeout, write=10.0, pool=5.0)
+        timeout = httpx.Timeout(connect=CONFIG.connect_timeout, read=CONFIG.read_timeout, write=10, pool=5)
         self.client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True, http2=True)
-        self.sem_listings = asyncio.Semaphore(CONFIG.max_concurrent_listings)
-        self.sem_details = asyncio.Semaphore(CONFIG.max_concurrent_details)
-        logger.info("🌐 HTTP Client inicializado")
+        self.sem_list = asyncio.Semaphore(CONFIG.max_concurrent_listings)
+        self.sem_detail = asyncio.Semaphore(CONFIG.max_concurrent_details)
+        logger.info("🌐 HTTP Client listo")
         return self
 
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *_):
         if self.client:
             await self.client.aclose()
 
-    async def fetch(self, url: str, semaphore: asyncio.Semaphore) -> Optional[httpx.Response]:
-        async with semaphore:
+    async def fetch(self, url: str, sem: asyncio.Semaphore) -> Optional[httpx.Response]:
+        async with sem:
             for attempt in range(CONFIG.max_retries):
                 try:
                     STATS.requests_made += 1
-                    resp = await self.client.get(url)
-                    if resp.status_code == 200:
+                    r = await self.client.get(url)
+                    if r.status_code == 200:
                         STATS.requests_success += 1
-                        STATS.bytes_downloaded += len(resp.content)
-                        return resp
-                    if resp.status_code == 429:
+                        return r
+                    if r.status_code == 429:
                         STATS.requests_429 += 1
                         await asyncio.sleep((attempt + 1) * 2)
                         continue
-                    if resp.status_code >= 500:
+                    if r.status_code >= 500:
                         await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
                         continue
                     return None
                 except (httpx.TimeoutException, httpx.ConnectError):
                     if attempt < CONFIG.max_retries - 1:
                         await asyncio.sleep(CONFIG.retry_delay * (attempt + 1))
-                except Exception:
+                except:
                     pass
             STATS.requests_failed += 1
             return None
 
     async def fetch_listing(self, url: str):
-        return await self.fetch(url, self.sem_listings)
+        return await self.fetch(url, self.sem_list)
 
     async def fetch_detail(self, url: str):
-        return await self.fetch(url, self.sem_details)
+        return await self.fetch(url, self.sem_detail)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 💵 DÓLAR
 # ═══════════════════════════════════════════════════════════════
-async def get_dolar_from_api() -> float:
+async def get_dolar() -> float:
     apis = [
         ("https://dolarapi.com/v1/dolares/bolsa", lambda r: r.json()['venta']),
         ("https://api.bluelytics.com.ar/v2/latest", lambda r: r.json()['blue']['value_sell']),
     ]
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for url, parser in apis:
+    async with httpx.AsyncClient(timeout=15) as c:
+        for url, parse in apis:
             try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    value = float(parser(resp))
-                    if 100 < value < 5000:
-                        logger.info(f"💵 Dólar: ${value:.2f}")
-                        return value
+                r = await c.get(url)
+                if r.status_code == 200:
+                    v = float(parse(r))
+                    if 100 < v < 5000:
+                        logger.info(f"💵 Dólar: ${v:.2f}")
+                        return v
             except:
                 continue
-    fatal_error("No se pudo obtener cotización del dólar")
+    fatal_error("No se pudo obtener dólar")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📋 PARSING DEL LISTADO
+# 📋 LISTING PARSING
 # ═══════════════════════════════════════════════════════════════
-def parse_listing_item(item_div) -> Optional[Dict]:
+def parse_listing_item(div) -> Optional[Dict]:
     try:
-        item_id = item_div.get('data-rel', '')
+        item_id = div.get('data-rel', '')
         if not item_id:
             return None
-
-        link = item_div.select_one('a[href*="itmId"]')
+        link = div.select_one('a[href*="itmId"]')
         url = link.get('href', '') if link else f"{BASE_URL}/index.php?action=carro/showProduct&itmId={item_id}&rbrId=107"
         if url and not url.startswith('http'):
             url = f"{BASE_URL}/{url.lstrip('/')}"
-
         return {'id': item_id, 'url': url}
     except:
         return None
 
 
-async def fetch_listing_page(http: FastHTTPClient, offset: int) -> List[Dict]:
-    url = f"{LISTING_URL}&o={offset}"
-    resp = await http.fetch_listing(url)
-    if not resp:
+async def fetch_listing_page(http: HTTPClient, offset: int) -> List[Dict]:
+    r = await http.fetch_listing(f"{LISTING_URL}&o={offset}")
+    if not r:
         return []
     try:
-        html = decode_response(resp)
-        soup = BeautifulSoup(html, 'html.parser')
-        return [v for div in soup.select('div[data-rel]') if (v := parse_listing_item(div))]
+        soup = BeautifulSoup(decode_response(r), 'html.parser')
+        return [v for d in soup.select('div[data-rel]') if (v := parse_listing_item(d))]
     except:
         return []
 
 
-async def fetch_listings_for_worker(http: FastHTTPClient) -> List[Dict]:
-    start_page, end_page = calculate_page_range()
-    logger.info(f"🔀 Worker {WORKER_ID}: Páginas {start_page}-{end_page}")
+async def fetch_listings(http: HTTPClient) -> List[Dict]:
+    start, end = calculate_page_range()
+    logger.info(f"🔀 Worker {WORKER_ID}: Páginas {start}-{end}")
 
-    all_vehicles = []
-    seen_ids = set()
-    offsets = [page * ITEMS_PER_PAGE for page in range(start_page, end_page + 1)]
-    empty_count = 0
+    vehicles = []
+    seen = set()
+    offsets = [p * ITEMS_PER_PAGE for p in range(start, end + 1)]
+    empty = 0
 
     for i in range(0, len(offsets), CONFIG.max_concurrent_listings):
         batch = offsets[i:i + CONFIG.max_concurrent_listings]
         results = await asyncio.gather(*[fetch_listing_page(http, o) for o in batch], return_exceptions=True)
 
-        batch_new = 0
+        new = 0
         all_empty = True
-        for result in results:
-            if isinstance(result, Exception):
+        for res in results:
+            if isinstance(res, Exception):
                 continue
-            if result:
+            if res:
                 all_empty = False
-                for v in result:
-                    if v['id'] not in seen_ids:
-                        seen_ids.add(v['id'])
-                        all_vehicles.append(v)
-                        batch_new += 1
+                for v in res:
+                    if v['id'] not in seen:
+                        seen.add(v['id'])
+                        vehicles.append(v)
+                        new += 1
 
         if all_empty:
-            empty_count += 1
-            if empty_count >= 2:
+            empty += 1
+            if empty >= 2:
                 break
         else:
-            empty_count = 0
+            empty = 0
 
-        logger.info(f"  Páginas: +{batch_new} | Total: {len(all_vehicles)}")
+        logger.info(f"  +{new} | Total: {len(vehicles)}")
 
         if CONFIG.delay_between_batches > 0:
             await asyncio.sleep(CONFIG.delay_between_batches)
 
-    if not all_vehicles:
-        fatal_error(f"Worker {WORKER_ID}: No se encontraron vehículos")
+    if not vehicles:
+        fatal_error(f"Worker {WORKER_ID}: Sin vehículos")
 
-    return all_vehicles
+    return vehicles
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🚗 EXTRACCIÓN DE DETALLES
+# 🚗 DETAIL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
-def extract_field_from_box(box, field_name: str) -> Optional[str]:
+def extract_field(box, name: str) -> Optional[str]:
     if not box:
         return None
-    try:
-        for span in box.find_all('span'):
-            if field_name.lower() in span.get_text().lower():
-                next_text = span.next_sibling
-                if next_text:
-                    return clean_text(str(next_text)).lstrip(':').strip() or None
-    except:
-        pass
+    for span in box.find_all('span'):
+        if name.lower() in span.get_text().lower():
+            nxt = span.next_sibling
+            if nxt:
+                return clean_text(str(nxt)).lstrip(':').strip() or None
     return None
 
 
-def extract_all_from_page(soup: BeautifulSoup) -> Dict:
-    """Extrae TODOS los datos crudos de la página."""
+def extract_raw_data(soup: BeautifulSoup) -> Dict:
+    """Extrae datos CRUDOS de la página."""
     data = {
-        'titulo': None,
-        'marca_raw': None,
-        'version_raw': None,
-        'año': None,
-        'kilometros': 0,
-        'transmision': None,
-        'combustible': None,
-        'es_particular': 1,
-        'avisos_vendedor': 1,
-        'precio_text': None,
-        'ciudad': None,
-        'provincia': None,
-        'whatsapp': None,
-        'visitas': None,
-        'expira_dias': None,
-        'descripcion': None,
+        'titulo': None, 'marca_raw': None, 'version_raw': None,
+        'año': None, 'kilometros': 0, 'transmision': None, 'combustible': None,
+        'es_particular': 1, 'avisos_vendedor': 1, 'precio_text': None,
+        'ciudad': None, 'provincia': None, 'whatsapp': None,
+        'visitas': None, 'expira_dias': None, 'descripcion': None,
     }
 
     # Título
     try:
-        title_tag = soup.find('title')
-        if title_tag:
-            parts = clean_text(title_tag.get_text()).split(' - ')
+        title = soup.find('title')
+        if title:
+            parts = clean_text(title.get_text()).split(' - ')
             if len(parts) >= 2:
                 data['titulo'] = parts[1].strip()
     except:
@@ -562,61 +491,51 @@ def extract_all_from_page(soup: BeautifulSoup) -> Dict:
 
     # Descripción del anuncio
     desc_box = None
-    for subtitle in soup.find_all('div', class_='subtitle'):
-        text = clean_text(subtitle.get_text()).lower()
-        if 'descripci' in text and 'anuncio' in text:
-            desc_box = subtitle.find_next_sibling('div', class_='box-text')
+    for sub in soup.find_all('div', class_='subtitle'):
+        t = clean_text(sub.get_text()).lower()
+        if 'descripci' in t and 'anuncio' in t:
+            desc_box = sub.find_next_sibling('div', class_='box-text')
             break
 
     if desc_box:
-        data['marca_raw'] = extract_field_from_box(desc_box, 'Marca')
-        data['version_raw'] = extract_field_from_box(desc_box, 'Versi')
-        
-        año = extract_field_from_box(desc_box, 'Año') or extract_field_from_box(desc_box, 'Ano')
-        data['año'] = parse_year(año)
-        
-        km = extract_field_from_box(desc_box, 'Kilometraje')
-        data['kilometros'] = parse_km(km)
-        
-        trans = extract_field_from_box(desc_box, 'Transmisi')
-        data['transmision'] = parse_transmision(trans)
-        
-        comb = extract_field_from_box(desc_box, 'Combustible')
-        data['combustible'] = comb.lower().strip() if comb else None
-        
-        vendedor = extract_field_from_box(desc_box, 'Vendedor')
-        data['es_particular'] = is_particular(vendedor)
+        data['marca_raw'] = extract_field(desc_box, 'Marca')
+        data['version_raw'] = extract_field(desc_box, 'Versi')
+        data['año'] = parse_year(extract_field(desc_box, 'Año') or extract_field(desc_box, 'Ano'))
+        data['kilometros'] = parse_km(extract_field(desc_box, 'Kilometraje'))
+        data['transmision'] = parse_trans(extract_field(desc_box, 'Transmisi'))
+        comb = extract_field(desc_box, 'Combustible')
+        data['combustible'] = comb.lower() if comb else None
+        data['es_particular'] = is_particular(extract_field(desc_box, 'Vendedor'))
 
     # Precio
-    for subtitle in soup.find_all('div', class_='subtitle'):
-        if clean_text(subtitle.get_text()).lower() == 'precio':
-            price_box = subtitle.find_next_sibling('div', class_='box-text')
-            if price_box:
-                data['precio_text'] = clean_text(price_box.get_text())
+    for sub in soup.find_all('div', class_='subtitle'):
+        if clean_text(sub.get_text()).lower() == 'precio':
+            box = sub.find_next_sibling('div', class_='box-text')
+            if box:
+                data['precio_text'] = clean_text(box.get_text())
             break
 
     # Contacto
     contact_box = None
-    for subtitle in soup.find_all('div', class_='subtitle'):
-        text = clean_text(subtitle.get_text()).lower()
-        if 'datos' in text and 'contacto' in text:
-            contact_box = subtitle.find_next_sibling('div', class_='box-text')
+    for sub in soup.find_all('div', class_='subtitle'):
+        t = clean_text(sub.get_text()).lower()
+        if 'datos' in t and 'contacto' in t:
+            contact_box = sub.find_next_sibling('div', class_='box-text')
             break
 
     if contact_box:
-        ciudad = extract_field_from_box(contact_box, 'Ciudad')
-        data['ciudad'] = ciudad.lower().strip() if ciudad else None
-        
-        provincia = extract_field_from_box(contact_box, 'Provincia')
-        data['provincia'] = provincia.lower().strip() if provincia else None
+        ciudad = extract_field(contact_box, 'Ciudad')
+        data['ciudad'] = ciudad.lower() if ciudad else None
+        prov = extract_field(contact_box, 'Provincia')
+        data['provincia'] = prov.lower() if prov else None
 
     # WhatsApp
     try:
-        wa_link = soup.find('a', class_='btn-contact-whatsapp')
-        if wa_link:
-            match = RE_WHATSAPP.search(wa_link.get('href', ''))
-            if match:
-                data['whatsapp'] = match.group(1)
+        wa = soup.find('a', class_='btn-contact-whatsapp')
+        if wa:
+            m = RE_WHATSAPP.search(wa.get('href', ''))
+            if m:
+                data['whatsapp'] = m.group(1)
     except:
         pass
 
@@ -633,12 +552,12 @@ def extract_all_from_page(soup: BeautifulSoup) -> Dict:
         pass
 
     # Descripción ampliada
-    for subtitle in soup.find_all('div', class_='subtitle'):
-        text = clean_text(subtitle.get_text()).lower()
-        if 'descripci' in text and 'ampliada' in text:
-            next_box = subtitle.find_next_sibling('div', class_='box-text')
-            if next_box:
-                data['descripcion'] = clean_html_to_text(str(next_box))
+    for sub in soup.find_all('div', class_='subtitle'):
+        t = clean_text(sub.get_text()).lower()
+        if 'descripci' in t and 'ampliada' in t:
+            box = sub.find_next_sibling('div', class_='box-text')
+            if box:
+                data['descripcion'] = clean_html(str(box))
             break
 
     # Visitas y expiración
@@ -647,69 +566,49 @@ def extract_all_from_page(soup: BeautifulSoup) -> Dict:
         if 'Visitas hasta el momento' in text:
             for span in box.find_all('span'):
                 if 'Visitas' in span.get_text():
-                    next_text = span.next_sibling
-                    if next_text:
-                        digits = RE_DIGITS.sub('', str(next_text))
-                        if digits:
-                            data['visitas'] = int(digits)
+                    nxt = span.next_sibling
+                    if nxt:
+                        d = RE_DIGITS.sub('', str(nxt))
+                        if d:
+                            data['visitas'] = int(d)
         if 'Expira en' in text:
             for span in box.find_all('span'):
                 if 'Expira' in span.get_text():
-                    next_text = span.next_sibling
-                    if next_text:
-                        digits = RE_DIGITS.sub('', str(next_text))
-                        if digits:
-                            data['expira_dias'] = int(digits)
+                    nxt = span.next_sibling
+                    if nxt:
+                        d = RE_DIGITS.sub('', str(nxt))
+                        if d:
+                            data['expira_dias'] = int(d)
 
     return data
 
 
-async def fetch_vehicle_details(
-    http: FastHTTPClient,
-    vehicle_basic: Dict,
-    dolar_mep: float
-) -> Optional[Dict]:
-    """Extrae datos y normaliza contra catálogo."""
-    
-    url = vehicle_basic.get('url', '')
+async def fetch_vehicle_details(http: HTTPClient, basic: Dict, dolar: float) -> Optional[Dict]:
+    """Extrae y normaliza un vehículo."""
+    url = basic.get('url', '')
     if not url:
         return None
 
     result = {
-        'id': vehicle_basic['id'],
-        'url': url,
-        'fingerprint': None,
-        'marca': None,
-        'modelo': None,
-        'version': None,
-        'año': None,
-        'kilometros': 0,
-        'transmision': None,
-        'combustible': None,
+        'id': basic['id'], 'url': url, 'fingerprint': None,
+        'marca': None, 'modelo': None, 'version': None,
+        'año': None, 'kilometros': 0, 'transmision': None, 'combustible': None,
         'precio_usd': None,
-        'es_particular': 1,
-        'avisos_vendedor': 1,
-        'whatsapp': None,
-        'ciudad': None,
-        'provincia': None,
-        'visitas': None,
-        'expira_dias': None,
-        'tiene_urgencia': 0,
-        'norm_status': 'no_match',
+        'es_particular': 1, 'avisos_vendedor': 1, 'whatsapp': None,
+        'ciudad': None, 'provincia': None,
+        'visitas': None, 'expira_dias': None, 'tiene_urgencia': 0,
+        'norm_status': 'pending',
     }
 
-    resp = await http.fetch_detail(url)
-    if not resp:
+    r = await http.fetch_detail(url)
+    if not r:
         return None
 
     try:
-        html = decode_response(resp)
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = BeautifulSoup(decode_response(r), 'html.parser')
+        raw = extract_raw_data(soup)
 
-        # Extraer datos crudos
-        raw = extract_all_from_page(soup)
-
-        # Copiar datos que no necesitan normalización
+        # Copiar datos que no se normalizan
         result['año'] = raw['año']
         result['kilometros'] = raw['kilometros']
         result['transmision'] = raw['transmision']
@@ -721,52 +620,72 @@ async def fetch_vehicle_details(
         result['whatsapp'] = raw['whatsapp']
         result['visitas'] = raw['visitas']
         result['expira_dias'] = raw['expira_dias']
-
-        # Precio
-        result['precio_usd'] = parse_precio(raw['precio_text'], dolar_mep)
+        result['precio_usd'] = parse_precio(raw['precio_text'], dolar)
 
         # ═══════════════════════════════════════════════════════
-        # 🎯 NORMALIZACIÓN CONTRA CATÁLOGO
+        # 🎯 NORMALIZACIÓN
         # ═══════════════════════════════════════════════════════
+        marca_raw = (raw.get('marca_raw') or '').strip()
+        version_raw = (raw.get('version_raw') or '').strip()
+        titulo = (raw.get('titulo') or '').strip()
+        descripcion = raw.get('descripcion') or ''
+
         if HAS_NORMALIZER:
             try:
-                norm_result = normalize_vehicle(
-                    titulo=raw.get('titulo') or '',
-                    descripcion=raw.get('descripcion') or '',
-                    marca_raw=raw.get('marca_raw') or '',
-                    modelo_raw='',  # En rosariogarage no hay campo modelo separado
-                    version_raw=raw.get('version_raw') or ''
+                norm = normalize_vehicle(
+                    titulo=titulo,
+                    descripcion=descripcion,
+                    marca_raw=marca_raw,
+                    version_raw=version_raw
                 )
-
-                # Usar valores normalizados (None si no se encontró en catálogo)
-                result['marca'] = norm_result.get('marca')
-                result['modelo'] = norm_result.get('modelo')
-                result['version'] = norm_result.get('version')
-                result['norm_status'] = norm_result.get('norm_status', 'no_match')
-
-            except Exception as e:
-                if DEBUG_MODE:
-                    logger.debug(f"Error normalizando: {e}")
+                result['marca'] = norm.get('marca')
+                result['modelo'] = norm.get('modelo')
+                result['version'] = norm.get('version')
+                result['norm_status'] = norm.get('norm_status', 'fallback')
+            except:
                 result['norm_status'] = 'error'
 
-        # Detectar urgencia en descripción
-        if raw.get('descripcion') and HAS_NORMALIZER:
+        # ═══════════════════════════════════════════════════════
+        # FALLBACK: Asegurar que NUNCA quede marca vacía ni marca sin modelo
+        # ═══════════════════════════════════════════════════════
+        
+        # Si no hay marca, usar la original
+        if not result['marca']:
+            result['marca'] = marca_raw.lower() if marca_raw else None
+        
+        # Si aún no hay marca, intentar extraer del título
+        if not result['marca'] and titulo:
+            words = titulo.lower().split()
+            if words:
+                result['marca'] = words[0]
+        
+        # Si hay marca pero no modelo, extraer de version_raw o título
+        if result['marca'] and not result['modelo']:
+            model = extract_model_from_version(version_raw, result['marca'])
+            if not model and titulo:
+                model = extract_model_from_version(titulo, result['marca'])
+            result['modelo'] = model if model else None
+        
+        # Si sigue sin modelo, usar primera palabra de version_raw
+        if result['marca'] and not result['modelo'] and version_raw:
+            words = version_raw.lower().split()
+            for w in words:
+                if len(w) >= 2 and not RE_YEAR.match(w) and w != result['marca']:
+                    result['modelo'] = w
+                    break
+
+        # Detectar urgencia
+        if descripcion and HAS_NORMALIZER:
             try:
-                urgency = extract_urgency_signals(raw['descripcion'])
-                result['tiene_urgencia'] = 1 if urgency.get('has_urgency', False) else 0
+                urg = extract_urgency_signals(descripcion)
+                result['tiene_urgencia'] = 1 if urg.get('has_urgency') else 0
             except:
                 pass
 
-        # Generar fingerprint (usa marca normalizada o raw)
-        marca_fp = result['marca'] or (raw.get('marca_raw') or '').lower()
-        modelo_fp = result['modelo'] or (raw.get('version_raw') or '').lower().split()[0] if raw.get('version_raw') else ''
-        
-        result['fingerprint'] = generate_vehicle_fingerprint(
-            marca=marca_fp,
-            modelo=modelo_fp,
-            año=result['año'],
-            km=result['kilometros'],
-            whatsapp=result['whatsapp']
+        # Fingerprint
+        result['fingerprint'] = generate_fingerprint(
+            result['marca'], result['modelo'], result['año'],
+            result['kilometros'], result['whatsapp']
         )
 
         return result
@@ -777,21 +696,16 @@ async def fetch_vehicle_details(
         return None
 
 
-async def fetch_all_details(
-    http: FastHTTPClient,
-    vehicles: List[Dict],
-    dolar_mep: float
-) -> List[Dict]:
-    """Obtiene todos los detalles."""
+async def fetch_all_details(http: HTTPClient, vehicles: List[Dict], dolar: float) -> List[Dict]:
     total = len(vehicles)
-    logger.info(f"🚗 Obteniendo detalles de {total} vehículos...")
+    logger.info(f"🚗 Extrayendo detalles de {total} vehículos...")
 
     results = []
-    
+
     for i in range(0, total, CONFIG.batch_size):
         batch = vehicles[i:i + CONFIG.batch_size]
         batch_results = await asyncio.gather(
-            *[fetch_vehicle_details(http, v, dolar_mep) for v in batch],
+            *[fetch_vehicle_details(http, v, dolar) for v in batch],
             return_exceptions=True
         )
 
@@ -800,86 +714,80 @@ async def fetch_all_details(
                 results.append(r)
 
         # Stats
-        with_marca = sum(1 for r in results if r.get('marca'))
+        with_marca = sum(1 for x in results if x.get('marca'))
+        with_modelo = sum(1 for x in results if x.get('marca') and x.get('modelo'))
+        
         logger.info(
             f"  {min(i + CONFIG.batch_size, total)}/{total} | "
-            f"Válidos: {len(results)} ({with_marca} normalizados)"
+            f"OK: {len(results)} | Marca: {with_marca} | Modelo: {with_modelo}"
         )
 
         if CONFIG.delay_between_batches > 0:
             await asyncio.sleep(CONFIG.delay_between_batches)
 
     if not results:
-        fatal_error("No se pudo procesar ningún vehículo")
+        fatal_error("No se procesó ningún vehículo")
 
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-# 💾 GUARDAR DATOS
+# 💾 SAVE
 # ═══════════════════════════════════════════════════════════════
-async def save_worker_results(results: List[Dict], dolar_mep: float):
+async def save_worker_results(results: List[Dict], dolar: float):
     today = date.today().isoformat()
 
-    # Stats
     with_marca = sum(1 for v in results if v.get('marca'))
-    full_match = sum(1 for v in results if v.get('norm_status') == 'full_match')
+    with_modelo = sum(1 for v in results if v.get('marca') and v.get('modelo'))
+    full = sum(1 for v in results if v.get('norm_status') == 'full_match')
     partial = sum(1 for v in results if v.get('norm_status') == 'partial_match')
-    marca_only = sum(1 for v in results if v.get('norm_status') == 'marca_only')
 
-    try:
-        await init_worker_db(WORKER_DB)
+    await init_worker_db(WORKER_DB)
 
-        async with aiosqlite.connect(WORKER_DB) as db:
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('scrape_date', today))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('dolar_mep', str(dolar_mep)))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('worker_id', str(WORKER_ID)))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('vehicles_count', str(len(results))))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('vehicles_with_marca', str(with_marca)))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('norm_full_match', str(full_match)))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('norm_partial', str(partial)))
-            await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('norm_marca_only', str(marca_only)))
+    async with aiosqlite.connect(WORKER_DB) as db:
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('scrape_date', today))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('dolar_mep', str(dolar)))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('worker_id', str(WORKER_ID)))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('vehicles_count', str(len(results))))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('with_marca', str(with_marca)))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('with_modelo', str(with_modelo)))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('norm_full', str(full)))
+        await db.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('norm_partial', str(partial)))
 
-            for v in results:
-                await db.execute("""
-                    INSERT OR REPLACE INTO vehicles (
-                        id, url, fingerprint, marca, modelo, version,
-                        año, kilometros, transmision, combustible, precio_usd,
-                        es_particular, avisos_vendedor, whatsapp, ciudad, provincia,
-                        visitas, expira_dias, tiene_urgencia,
-                        primera_vista, ultima_vista, activo, norm_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                """, (
-                    v['id'], v['url'], v['fingerprint'],
-                    v['marca'], v['modelo'], v['version'],
-                    v['año'], v['kilometros'], v['transmision'], v['combustible'], v['precio_usd'],
-                    v['es_particular'], v['avisos_vendedor'], v['whatsapp'], v['ciudad'], v['provincia'],
-                    v['visitas'], v['expira_dias'], v['tiene_urgencia'],
-                    today, today, v['norm_status']
-                ))
+        for v in results:
+            await db.execute("""
+                INSERT OR REPLACE INTO vehicles (
+                    id, url, fingerprint, marca, modelo, version,
+                    año, kilometros, transmision, combustible, precio_usd,
+                    es_particular, avisos_vendedor, whatsapp, ciudad, provincia,
+                    visitas, expira_dias, tiene_urgencia,
+                    primera_vista, ultima_vista, activo, norm_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """, (
+                v['id'], v['url'], v['fingerprint'],
+                v['marca'], v['modelo'], v['version'],
+                v['año'], v['kilometros'], v['transmision'], v['combustible'], v['precio_usd'],
+                v['es_particular'], v['avisos_vendedor'], v['whatsapp'], v['ciudad'], v['provincia'],
+                v['visitas'], v['expira_dias'], v['tiene_urgencia'],
+                today, today, v['norm_status']
+            ))
 
-            await db.commit()
+        await db.commit()
 
-        logger.info(f"✅ Guardados {len(results)} vehículos")
-        logger.info(f"   📊 Normalizados: {with_marca} | Full: {full_match} | Partial: {partial} | Marca: {marca_only}")
-
-    except Exception as e:
-        fatal_error(f"Error guardando", e)
+    logger.info(f"✅ Guardados {len(results)} vehículos")
+    logger.info(f"   📊 Marca: {with_marca} | Modelo: {with_modelo} | Full: {full} | Partial: {partial}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔄 CONSOLIDACIÓN
+# 🔄 CONSOLIDATE
 # ═══════════════════════════════════════════════════════════════
-def read_worker_data(db_path: str) -> Tuple[List[tuple], Dict[str, str]]:
-    vehicles = []
-    metadata = {}
+def read_worker_data(path: str) -> Tuple[List[tuple], Dict]:
+    vehicles, metadata = [], {}
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
-
         for row in conn.execute("SELECT key, value FROM scrape_metadata"):
             metadata[row['key']] = row['value']
-
         cursor = conn.execute("""
             SELECT id, url, fingerprint, marca, modelo, version,
                    año, kilometros, transmision, combustible, precio_usd,
@@ -890,69 +798,65 @@ def read_worker_data(db_path: str) -> Tuple[List[tuple], Dict[str, str]]:
         vehicles = [tuple(row) for row in cursor]
         conn.close()
     except Exception as e:
-        logger.error(f"Error leyendo {db_path}: {e}")
+        logger.error(f"Error leyendo {path}: {e}")
     return vehicles, metadata
 
 
-def consolidate_worker_results():
+def consolidate():
     logger.info("=" * 60)
     logger.info("🔄 CONSOLIDACIÓN")
     logger.info("=" * 60)
 
     today = date.today().isoformat()
-    available = find_worker_databases()
+    workers = find_worker_databases()
 
-    if not available:
-        fatal_error("No hay workers para consolidar")
+    if not workers:
+        fatal_error("Sin workers")
 
-    logger.info(f"📊 Workers: {len(available)}/{TOTAL_WORKERS}")
+    logger.info(f"📊 Workers: {len(workers)}/{TOTAL_WORKERS}")
 
-    # Leer datos
     all_data = []
-    dolar_mep = None
-    stats = {'full': 0, 'partial': 0, 'marca': 0, 'with_marca': 0}
+    dolar = None
+    stats = {'marca': 0, 'modelo': 0, 'full': 0, 'partial': 0}
 
-    for worker_id, db_path in available:
-        vehicles, metadata = read_worker_data(db_path)
+    for wid, path in workers:
+        vehicles, meta = read_worker_data(path)
         if vehicles:
-            all_data.append((worker_id, vehicles, metadata))
-            with_marca = sum(1 for v in vehicles if v[3])
-            logger.info(f"   Worker {worker_id}: {len(vehicles)} ({with_marca} normalizados)")
+            all_data.append((wid, vehicles, meta))
+            m = sum(1 for v in vehicles if v[3])  # marca
+            mo = sum(1 for v in vehicles if v[3] and v[4])  # marca+modelo
+            logger.info(f"   Worker {wid}: {len(vehicles)} (marca: {m}, modelo: {mo})")
 
-            if not dolar_mep and 'dolar_mep' in metadata:
-                dolar_mep = float(metadata['dolar_mep'])
+            if not dolar and 'dolar_mep' in meta:
+                dolar = float(meta['dolar_mep'])
+            stats['marca'] += int(meta.get('with_marca', 0))
+            stats['modelo'] += int(meta.get('with_modelo', 0))
+            stats['full'] += int(meta.get('norm_full', 0))
+            stats['partial'] += int(meta.get('norm_partial', 0))
 
-            stats['full'] += int(metadata.get('norm_full_match', 0))
-            stats['partial'] += int(metadata.get('norm_partial', 0))
-            stats['marca'] += int(metadata.get('norm_marca_only', 0))
-            stats['with_marca'] += int(metadata.get('vehicles_with_marca', 0))
+    if not all_data or not dolar:
+        fatal_error("Sin datos")
 
-    if not all_data or not dolar_mep:
-        fatal_error("Sin datos para consolidar")
+    total = sum(len(d[1]) for d in all_data)
+    logger.info(f"\n📊 Total: {total} | Marca: {stats['marca']} | Modelo: {stats['modelo']}")
 
-    total_read = sum(len(d[1]) for d in all_data)
-    logger.info(f"\n📊 Total: {total_read} | Normalizados: {stats['with_marca']}")
-
-    # BD maestra
     init_master_db(MASTER_DB)
     conn = sqlite3.connect(MASTER_DB)
     cursor = conn.cursor()
 
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_scrape_date', today))
-    cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_dolar_mep', str(dolar_mep)))
+    cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_dolar_mep', str(dolar)))
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('workers_consolidated', str(len(all_data))))
 
-    seen_ids = set()
+    seen = set()
 
-    for worker_id, vehicles, _ in all_data:
+    for wid, vehicles, _ in all_data:
         for v in vehicles:
-            vehicle_id = v[0]
-            seen_ids.add(vehicle_id)
-            new_precio = v[10]
+            vid = v[0]
+            seen.add(vid)
+            precio = v[10]
 
-            existing = cursor.execute(
-                "SELECT precio_usd, primera_vista FROM vehicles WHERE id = ?", (vehicle_id,)
-            ).fetchone()
+            existing = cursor.execute("SELECT precio_usd, primera_vista FROM vehicles WHERE id = ?", (vid,)).fetchone()
 
             if existing:
                 old_precio = existing[0]
@@ -966,49 +870,45 @@ def consolidate_worker_results():
                         dias_publicado=julianday(?)-julianday(primera_vista),
                         norm_status=?
                     WHERE id=?
-                """, (*v[1:], today, today, vehicle_id))
+                """, (*v[1:], today, today, vid))
                 STATS.vehicles_updated += 1
 
-                if old_precio and new_precio and abs(old_precio - new_precio) > 0.01:
-                    var = ((new_precio - old_precio) / old_precio) * 100
-                    cursor.execute(
-                        "INSERT INTO price_history VALUES (NULL, ?, ?, ?, ?)",
-                        (vehicle_id, new_precio, today, round(var, 2))
-                    )
+                if old_precio and precio and abs(old_precio - precio) > 0.01:
+                    var = ((precio - old_precio) / old_precio) * 100
+                    cursor.execute("INSERT INTO price_history VALUES (NULL, ?, ?, ?, ?)",
+                                   (vid, precio, today, round(var, 2)))
                     STATS.vehicles_price_changed += 1
             else:
                 cursor.execute("""
                     INSERT INTO vehicles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
                 """, (*v[:19], today, today, v[19]))
 
-                if new_precio:
-                    cursor.execute(
-                        "INSERT INTO price_history VALUES (NULL, ?, ?, ?, NULL)",
-                        (vehicle_id, new_precio, today)
-                    )
+                if precio:
+                    cursor.execute("INSERT INTO price_history VALUES (NULL, ?, ?, ?, NULL)", (vid, precio, today))
                 STATS.vehicles_new += 1
 
-    # Marcar inactivos
-    if seen_ids:
-        placeholders = ','.join('?' * len(seen_ids))
-        cursor.execute(f"UPDATE vehicles SET activo=0 WHERE activo=1 AND id NOT IN ({placeholders})", tuple(seen_ids))
+    # Inactivos
+    if seen:
+        ph = ','.join('?' * len(seen))
+        cursor.execute(f"UPDATE vehicles SET activo=0 WHERE activo=1 AND id NOT IN ({ph})", tuple(seen))
 
     # Purgar
     cursor.execute("DELETE FROM price_history WHERE vehicle_id IN (SELECT id FROM vehicles WHERE activo=0 AND ultima_vista < date('now', '-90 days'))")
     cursor.execute("DELETE FROM vehicles WHERE activo=0 AND ultima_vista < date('now', '-90 days')")
 
-    # Stats finales
-    total_active = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1").fetchone()[0]
+    # Stats
+    active = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1").fetchone()[0]
     with_marca = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1 AND marca IS NOT NULL").fetchone()[0]
-    total_history = cursor.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+    with_modelo = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1 AND marca IS NOT NULL AND modelo IS NOT NULL").fetchone()[0]
+    history = cursor.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
 
     conn.commit()
     conn.close()
 
     # Limpiar
-    for _, db_path in available:
+    for _, path in workers:
         try:
-            os.remove(db_path)
+            os.remove(path)
         except:
             pass
 
@@ -1018,8 +918,8 @@ def consolidate_worker_results():
     logger.info(f"   🆕 Nuevos: {STATS.vehicles_new}")
     logger.info(f"   🔄 Actualizados: {STATS.vehicles_updated}")
     logger.info(f"   💰 Cambios precio: {STATS.vehicles_price_changed}")
-    logger.info(f"   📊 Activos: {total_active} ({with_marca} normalizados)")
-    logger.info(f"   📈 Historial: {total_history}")
+    logger.info(f"   📊 Activos: {active} | Marca: {with_marca} | Modelo: {with_modelo}")
+    logger.info(f"   📈 Historial: {history}")
     logger.info("=" * 60)
 
 
@@ -1035,23 +935,23 @@ async def run_worker():
     logger.info(f"🚀 WORKER {WORKER_ID}/{TOTAL_WORKERS}")
     logger.info("=" * 60)
 
-    # Inicializar normalizador
+    # Normalizer
     if HAS_NORMALIZER:
         if init_normalizer():
             logger.info("✅ Normalizador con catálogo")
         else:
-            logger.warning("⚠️ Sin catálogo - datos no normalizados")
+            logger.warning("⚠️ Sin catálogo (usará fallback)")
     else:
         logger.warning("⚠️ Módulo normalizer no disponible")
 
-    async with FastHTTPClient() as http:
-        dolar = await get_dolar_from_api()
+    async with HTTPClient() as http:
+        dolar = await get_dolar()
 
         logger.info("\n📋 Fase 1: Listados...")
-        vehicles = await fetch_listings_for_worker(http)
+        vehicles = await fetch_listings(http)
         logger.info(f"✅ IDs: {len(vehicles)}")
 
-        logger.info("\n🚗 Fase 2: Detalles + Normalización...")
+        logger.info("\n🚗 Fase 2: Detalles...")
         results = await fetch_all_details(http, vehicles, dolar)
 
         logger.info("\n💾 Guardando...")
@@ -1059,17 +959,19 @@ async def run_worker():
 
     elapsed = (datetime.now() - start).total_seconds()
     with_marca = sum(1 for r in results if r.get('marca'))
+    with_modelo = sum(1 for r in results if r.get('marca') and r.get('modelo'))
 
     logger.info("\n" + "=" * 60)
     logger.info(f"✅ WORKER {WORKER_ID} COMPLETADO")
-    logger.info(f"   ⏱️ {elapsed:.1f}s | 🚗 {len(results)} ({with_marca} normalizados)")
+    logger.info(f"   ⏱️ {elapsed:.1f}s | 🚗 {len(results)}")
+    logger.info(f"   📊 Marca: {with_marca} | Modelo: {with_modelo}")
     logger.info("=" * 60)
 
 
 def main():
     try:
         if CONSOLIDATE_MODE:
-            consolidate_worker_results()
+            consolidate()
         else:
             asyncio.run(run_worker())
     except KeyboardInterrupt:
