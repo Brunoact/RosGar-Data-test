@@ -28,22 +28,22 @@ jobs:
       max-parallel: 8
       matrix:
         worker_id: [0, 1, 2, 3, 4, 5, 6, 7]
-    
+
     steps:
       - name: 📥 Checkout código
         uses: actions/checkout@v4
-      
+
       - name: 🐍 Configurar Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      
+
       - name: 📦 Instalar dependencias
         run: |
           pip install --upgrade pip
-          pip install httpx[http2] beautifulsoup4 lxml aiosqlite
-      
+          pip install -r requirements.txt
+
       - name: 🚀 Ejecutar Worker ${{ matrix.worker_id }}
         env:
           WORKER_ID: ${{ matrix.worker_id }}
@@ -51,7 +51,7 @@ jobs:
           DEBUG_MODE: ${{ inputs.debug || 'false' }}
         run: python scraper_rosariogarage.py
         timeout-minutes: 30
-      
+
       - name: 📊 Info de la BD del worker
         if: always()
         run: |
@@ -69,7 +69,7 @@ jobs:
             ls -la
             exit 1
           fi
-      
+
       - name: 📤 Subir BD del worker
         if: success()
         uses: actions/upload-artifact@v4
@@ -87,22 +87,21 @@ jobs:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
     needs: scrape
-    # Ejecutar si al menos un worker tuvo éxito
     if: always() && !cancelled() && needs.scrape.result != 'failure'
-    
+
     steps:
       - name: 📥 Checkout código
         uses: actions/checkout@v4
-      
+
       - name: 🐍 Configurar Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
+
       - name: 📦 Instalar dependencias
         run: |
           pip install --upgrade pip
-          pip install httpx beautifulsoup4 lxml aiosqlite
+          pip install -r requirements.txt
 
       - name: 📥 Descargar BD maestra de ejecución anterior
         id: download-master
@@ -135,23 +134,17 @@ jobs:
         run: |
           echo "=== Estructura de worker_downloads ==="
           find ./worker_downloads -type f -name "*.db" -ls || echo "No hay archivos .db"
-          
           echo ""
           echo "=== Moviendo archivos al directorio raíz ==="
-          
-          # Buscar y mover todos los .db de workers
           find ./worker_downloads -type f -name "rosariogarage_worker_*.db" -exec mv {} . \;
-          
           echo ""
           echo "=== Archivos .db en directorio actual ==="
           ls -lh *.db 2>/dev/null || echo "No hay archivos .db"
-          
           echo ""
           echo "=== Verificación detallada de workers ==="
           FOUND=0
           MISSING=0
           TOTAL_VEHICLES=0
-          
           for i in {0..7}; do
             DB_FILE="rosariogarage_worker_${i}.db"
             if [ -f "$DB_FILE" ]; then
@@ -165,20 +158,17 @@ jobs:
               MISSING=$((MISSING + 1))
             fi
           done
-          
           echo ""
           echo "════════════════════════════════════════"
           echo "📊 RESUMEN: ${FOUND}/8 workers encontrados"
           echo "🚗 Total vehículos en workers: ${TOTAL_VEHICLES}"
           echo "════════════════════════════════════════"
           
-          # Fallar si no hay ningún worker
           if [ $FOUND -eq 0 ]; then
             echo "❌ ERROR CRÍTICO: No se encontró ningún archivo de worker"
             exit 1
           fi
           
-          # Advertencia si faltan muchos workers
           if [ $FOUND -lt 4 ]; then
             echo "⚠️ ADVERTENCIA: Solo ${FOUND}/8 workers disponibles"
           fi
@@ -223,16 +213,31 @@ jobs:
               print(f"   └─ Inactivos:    {format_number(inactivos)}")
               print()
               
+              # Normalización
+              normalizados = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE norm_status = 'full_match' AND activo = 1"
+              ).fetchone()[0]
+              parciales = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE norm_status = 'partial_match' AND activo = 1"
+              ).fetchone()[0]
+              no_match = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE norm_status IN ('marca_only', 'no_match') AND activo = 1"
+              ).fetchone()[0]
+              
+              print(f"🔧 NORMALIZACIÓN (activos)")
+              print(f"   ├─ Completa:     {format_number(normalizados)}")
+              print(f"   ├─ Parcial:      {format_number(parciales)}")
+              print(f"   └─ Sin match:    {format_number(no_match)}")
+              print()
+              
               # Nuevos y cambios hoy
               today = date.today().isoformat()
               nuevos_hoy = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
               ).fetchone()[0]
-              
               cambios_precio_hoy = conn.execute(
                   "SELECT COUNT(*) FROM price_history WHERE fecha = ?", (today,)
               ).fetchone()[0]
-              
               actualizados_hoy = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE ultima_vista = ? AND primera_vista != ?",
                   (today, today)
@@ -251,8 +256,10 @@ jobs:
                       MAX(precio_usd) as max_precio,
                       AVG(precio_usd) as avg_precio,
                       COUNT(*) as count
-                  FROM vehicles
-                  WHERE activo = 1 AND precio_usd IS NOT NULL AND precio_usd > 0
+                  FROM vehicles 
+                  WHERE activo = 1 
+                    AND precio_usd IS NOT NULL 
+                    AND precio_usd > 0
               """).fetchone()
               
               if precio_stats[3] > 0:
@@ -262,14 +269,16 @@ jobs:
                   print(f"   Promedio:        ${format_number(int(precio_stats[2]))}")
                   print()
               
-              # Top marcas
-              print(f"🏭 TOP 10 MARCAS (Activos)")
+              # Top marcas normalizadas
+              print(f"🏭 TOP 10 MARCAS NORMALIZADAS (Activos)")
               for marca, count in conn.execute("""
-                  SELECT marca, COUNT(*) as c
-                  FROM vehicles
-                  WHERE activo = 1 AND marca IS NOT NULL AND marca != 'N/A'
-                  GROUP BY marca
-                  ORDER BY c DESC
+                  SELECT marca_norm, COUNT(*) as c 
+                  FROM vehicles 
+                  WHERE activo = 1 
+                    AND marca_norm IS NOT NULL 
+                    AND marca_norm != ''
+                  GROUP BY marca_norm 
+                  ORDER BY c DESC 
                   LIMIT 10
               """):
                   bar = '█' * min(30, max(1, int(count * 30 / max(activos, 1))))
@@ -283,16 +292,13 @@ jobs:
               
               if 'last_dolar_mep' in metadata:
                   print(f"💵 Dólar MEP: ${float(metadata['last_dolar_mep']):.2f}")
-              
               if 'workers_consolidated' in metadata:
                   print(f"👷 Workers consolidados: {metadata['workers_consolidated']}")
-              
               if 'rate_limits_429' in metadata and int(metadata.get('rate_limits_429', 0)) > 0:
                   print(f"⚠️ Rate limits detectados: {metadata['rate_limits_429']}")
               
               total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
               print(f"📜 Registros de historial: {format_number(total_history)}")
-              
               print("=" * 60)
               
               # Generar JSON para GitHub Summary
@@ -302,6 +308,8 @@ jobs:
                   "nuevos_hoy": nuevos_hoy,
                   "actualizados_hoy": actualizados_hoy,
                   "cambios_precio": cambios_precio_hoy,
+                  "normalizados": normalizados,
+                  "parciales": parciales,
                   "dolar_mep": float(metadata.get('last_dolar_mep', 0)),
                   "workers": int(metadata.get('workers_consolidated', 0))
               }
@@ -348,6 +356,8 @@ jobs:
             NUEVOS=$(jq -r '.nuevos_hoy' summary.json)
             ACTUALIZADOS=$(jq -r '.actualizados_hoy' summary.json)
             CAMBIOS=$(jq -r '.cambios_precio' summary.json)
+            NORMALIZADOS=$(jq -r '.normalizados' summary.json)
+            PARCIALES=$(jq -r '.parciales' summary.json)
             DOLAR=$(jq -r '.dolar_mep' summary.json)
             WORKERS=$(jq -r '.workers' summary.json)
           else
@@ -355,6 +365,8 @@ jobs:
             NUEVOS="Error"
             ACTUALIZADOS="Error"
             CAMBIOS="Error"
+            NORMALIZADOS="Error"
+            PARCIALES="Error"
             DOLAR="Error"
             WORKERS="Error"
           fi
@@ -375,6 +387,13 @@ jobs:
           | 💰 Cambios de precio | **${CAMBIOS}** |
           | 💵 Dólar MEP | **\$${DOLAR}** |
           
+          ## 🔧 Normalización
+          
+          | Estado | Cantidad |
+          |--------|----------|
+          | ✅ Completa (marca+modelo+versión) | **${NORMALIZADOS}** |
+          | 🟡 Parcial (marca+modelo) | **${PARCIALES}** |
+          
           ## 📥 Descarga
           
           La base de datos completa está disponible en los **Artifacts** del workflow.
@@ -394,7 +413,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: consolidate
     if: always()
-    
+
     steps:
       - name: 🗑️ Eliminar artifacts de workers
         uses: geekyeggo/delete-artifact@v4
@@ -410,7 +429,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [scrape, consolidate]
     if: failure()
-    
+
     steps:
       - name: 📝 Registrar fallo en summary
         run: |
@@ -427,6 +446,7 @@ jobs:
           2. Verificar el paso "Organizar archivos de workers" en consolidación
           3. Comprobar si el sitio web está accesible
           4. Revisar límites de rate limiting
+          5. Verificar que el catálogo de vehículos existe en config/
           
           ---
           *El workflow se reintentará en la próxima ejecución programada*
