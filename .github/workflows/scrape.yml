@@ -1,8 +1,9 @@
+# .github/workflows/scrape.yml
+
 name: 🚗 RosarioGarage Scraper
 
 on:
   schedule:
-    # Ejecutar diariamente a las 6:00 UTC (3:00 AM Argentina)
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
@@ -17,9 +18,11 @@ env:
   TOTAL_WORKERS: 8
 
 jobs:
-  # ══════════════════════════════════════════════════════════════
-  # JOB 1: Scraping distribuido en 8 workers
-  # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# JOB 1: Scraping distribuido en 8 workers
+# ══════════════════════════════════════════════════════════════
+
   scrape:
     name: 🔹 Worker ${{ matrix.worker_id }}
     runs-on: ubuntu-latest
@@ -80,9 +83,10 @@ jobs:
           compression-level: 6
           if-no-files-found: error
 
-  # ══════════════════════════════════════════════════════════════
-  # JOB 2: Consolidar resultados de todos los workers
-  # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# JOB 2: Consolidar resultados de todos los workers
+# ══════════════════════════════════════════════════════════════
+
   consolidate:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
@@ -134,21 +138,21 @@ jobs:
         run: |
           echo "=== Estructura de worker_downloads ==="
           find ./worker_downloads -type f -name "*.db" -ls || echo "No hay archivos .db"
-          
+
           echo ""
           echo "=== Moviendo archivos al directorio raíz ==="
           find ./worker_downloads -type f -name "rosariogarage_worker_*.db" -exec mv {} . \;
-          
+
           echo ""
           echo "=== Archivos .db en directorio actual ==="
           ls -lh *.db 2>/dev/null || echo "No hay archivos .db"
-          
+
           echo ""
           echo "=== Verificación detallada de workers ==="
           FOUND=0
           MISSING=0
           TOTAL_VEHICLES=0
-          
+
           for i in {0..7}; do
             DB_FILE="rosariogarage_worker_${i}.db"
             if [ -f "$DB_FILE" ]; then
@@ -162,18 +166,18 @@ jobs:
               MISSING=$((MISSING + 1))
             fi
           done
-          
+
           echo ""
           echo "════════════════════════════════════════"
           echo "📊 RESUMEN: ${FOUND}/8 workers encontrados"
           echo "🚗 Total vehículos en workers: ${TOTAL_VEHICLES}"
           echo "════════════════════════════════════════"
-          
+
           if [ $FOUND -eq 0 ]; then
             echo "❌ ERROR CRÍTICO: No se encontró ningún archivo de worker"
             exit 1
           fi
-          
+
           if [ $FOUND -lt 4 ]; then
             echo "⚠️ ADVERTENCIA: Solo ${FOUND}/8 workers disponibles"
           fi
@@ -200,25 +204,23 @@ jobs:
 
           try:
               conn = sqlite3.connect('rosariogarage.db')
-              
+
               print("=" * 60)
               print("📊 RESUMEN DEL SCRAPING - ROSARIOGARAGE")
               print("=" * 60)
               print(f"📅 Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
               print()
-              
-              # Vehículos
+
               total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
               activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
               inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
-              
+
               print(f"🚗 VEHÍCULOS")
               print(f"   Total en BD:     {format_number(total)}")
               print(f"   ├─ Activos:      {format_number(activos)}")
               print(f"   └─ Inactivos:    {format_number(inactivos)}")
               print()
-              
-              # Normalización (CORREGIDO: usar norm_status en lugar de normalizacion)
+
               normalizados = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE norm_status = 'full_match' AND activo = 1"
               ).fetchone()[0]
@@ -228,14 +230,13 @@ jobs:
               no_match = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE norm_status IN ('marca_only', 'no_match', 'raw', 'pending') AND activo = 1"
               ).fetchone()[0]
-              
+
               print(f"🔧 NORMALIZACIÓN (activos)")
               print(f"   ├─ Completa:     {format_number(normalizados)}")
               print(f"   ├─ Parcial:      {format_number(parciales)}")
               print(f"   └─ Sin match:    {format_number(no_match)}")
               print()
-              
-              # Nuevos y cambios hoy
+
               today = date.today().isoformat()
               nuevos_hoy = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
@@ -247,35 +248,33 @@ jobs:
                   "SELECT COUNT(*) FROM vehicles WHERE ultima_vista = ? AND primera_vista != ?",
                   (today, today)
               ).fetchone()[0]
-              
+
               print(f"📈 CAMBIOS HOY")
               print(f"   Nuevos:          {format_number(nuevos_hoy)}")
               print(f"   Actualizados:    {format_number(actualizados_hoy)}")
               print(f"   Cambios precio:  {format_number(cambios_precio_hoy)}")
               print()
-              
-              # Rango de precios
+
               precio_stats = conn.execute("""
-                  SELECT 
+                  SELECT
                       MIN(precio_usd) as min_precio,
                       MAX(precio_usd) as max_precio,
                       AVG(precio_usd) as avg_precio,
                       COUNT(*) as count
-                  FROM vehicles 
+                  FROM vehicles
                   WHERE activo = 1 AND precio_usd IS NOT NULL AND precio_usd > 0
               """).fetchone()
-              
+
               if precio_stats[3] > 0:
                   print(f"💰 RANGO DE PRECIOS (USD)")
                   print(f"   Mínimo:          ${format_number(int(precio_stats[0]))}")
                   print(f"   Máximo:          ${format_number(int(precio_stats[1]))}")
                   print(f"   Promedio:        ${format_number(int(precio_stats[2]))}")
                   print()
-              
-              # Top marcas (CORREGIDO: usar 'marca' en lugar de 'marca_norm')
+
               print(f"🏭 TOP 10 MARCAS (Activos)")
               for marca, count in conn.execute("""
-                  SELECT marca, COUNT(*) as c 
+                  SELECT marca, COUNT(*) as c
                   FROM vehicles
                   WHERE activo = 1 AND marca IS NOT NULL AND marca != ''
                   GROUP BY marca
@@ -285,55 +284,50 @@ jobs:
                   bar = '█' * min(30, max(1, int(count * 30 / max(activos, 1))))
                   print(f"   {marca:15s} {count:5} {bar}")
               print()
-              
-              # Vendedores particulares vs agencias
+
               particulares = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND es_particular = 1"
               ).fetchone()[0]
               agencias = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND es_particular = 0"
               ).fetchone()[0]
-              
+
               print(f"👤 TIPO DE VENDEDOR (Activos)")
               print(f"   Particulares:    {format_number(particulares)}")
               print(f"   Agencias:        {format_number(agencias)}")
               print()
-              
-              # Vehículos con urgencia
+
               con_urgencia = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE activo = 1 AND tiene_urgencia = 1"
               ).fetchone()[0]
               print(f"🔥 Con señales de urgencia: {format_number(con_urgencia)}")
               print()
-              
-              # Metadata
+
               metadata = {}
               for key, value in conn.execute("SELECT key, value FROM scrape_metadata"):
                   metadata[key] = value
-              
+
               if 'last_dolar_mep' in metadata:
                   print(f"💵 Dólar MEP: ${float(metadata['last_dolar_mep']):.2f}")
-              
+
               if 'workers_consolidated' in metadata:
                   print(f"👷 Workers consolidados: {metadata['workers_consolidated']}")
-              
+
               if 'rate_limits_429' in metadata and int(metadata.get('rate_limits_429', 0)) > 0:
                   print(f"⚠️ Rate limits detectados: {metadata['rate_limits_429']}")
-              
+
               total_history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
               print(f"📜 Registros de historial: {format_number(total_history)}")
-              
-              # Re-publicaciones detectadas
+
               try:
                   repubs = conn.execute("SELECT COUNT(*) FROM republication_log").fetchone()[0]
                   if repubs > 0:
                       print(f"🔁 Re-publicaciones detectadas: {format_number(repubs)}")
               except:
                   pass
-              
+
               print("=" * 60)
-              
-              # Generar JSON para GitHub Summary
+
               summary_data = {
                   "total": total,
                   "activos": activos,
@@ -348,12 +342,12 @@ jobs:
                   "dolar_mep": float(metadata.get('last_dolar_mep', 0)),
                   "workers": int(metadata.get('workers_consolidated', 0))
               }
-              
+
               with open("summary.json", "w") as f:
                   json.dump(summary_data, f)
-              
+
               conn.close()
-              
+
           except Exception as e:
               print(f"❌ Error generando estadísticas: {e}")
               import traceback
@@ -366,7 +360,7 @@ jobs:
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
           SIZE_HR=$(du -h rosariogarage.db | cut -f1)
           echo "💾 Tamaño actual: $SIZE_HR"
-          
+
           if [ $SIZE_MB -gt 50 ]; then
             echo "🔧 Ejecutando VACUUM para optimizar..."
             sqlite3 rosariogarage.db "VACUUM;"
@@ -374,7 +368,10 @@ jobs:
             echo "✅ Nuevo tamaño: $NEW_SIZE"
           fi
 
-      - name: 📤 Subir BD consolidada
+      # ─────────────────────────────────────────────────────────
+      # Subir como artifact interno (para el próximo scrape)
+      # ─────────────────────────────────────────────────────────
+      - name: 📤 Subir BD consolidada (uso interno scraper)
         uses: actions/upload-artifact@v4
         with:
           name: rosariogarage-master-db
@@ -382,6 +379,41 @@ jobs:
           retention-days: 90
           compression-level: 9
           if-no-files-found: error
+
+      # ─────────────────────────────────────────────────────────
+      # NUEVO ① — Subir DB para el dashboard (nombre distinto
+      #            para que el repo 2 lo encuentre por workflow)
+      # ─────────────────────────────────────────────────────────
+      - name: 📦 Subir DB para dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-db          # ← nombre que usa sync-db.yml
+          path: rosariogarage.db
+          retention-days: 90
+          compression-level: 9
+          if-no-files-found: error
+
+      # ─────────────────────────────────────────────────────────
+      # NUEVO ② — Obtener fecha actual para el payload
+      # ─────────────────────────────────────────────────────────
+      - name: 📅 Obtener fecha actual
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────────────────
+      # NUEVO ③ — Disparar deploy en repo dashboard
+      # ─────────────────────────────────────────────────────────
+      - name: 🚀 Disparar deploy en repo dashboard
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DASHBOARD_REPO_PAT }}
+          repository: TU_USUARIO/autos-dashboard   # ← cambiá esto
+          event-type: db-updated
+          client-payload: |
+            {
+              "run_id": "${{ github.run_id }}",
+              "scrape_date": "${{ steps.date.outputs.date }}"
+            }
 
       - name: 📝 Crear resumen del workflow
         if: always()
@@ -411,14 +443,14 @@ jobs:
             DOLAR="Error"
             WORKERS="Error"
           fi
-          
+
           cat >> $GITHUB_STEP_SUMMARY << EOF
           # ✅ Scraping RosarioGarage Completado
-          
+
           **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
-          
+
           ## 📊 Resumen
-          
+
           | Métrica | Valor |
           |---------|-------|
           | 👷 Workers consolidados | **${WORKERS}/8** |
@@ -427,36 +459,37 @@ jobs:
           | 🔄 Actualizados | **${ACTUALIZADOS}** |
           | 💰 Cambios de precio | **${CAMBIOS}** |
           | 💵 Dólar MEP | **\$${DOLAR}** |
-          
+
           ## 🔧 Normalización
-          
+
           | Estado | Cantidad |
           |--------|----------|
           | ✅ Completa (marca+modelo+versión) | **${NORMALIZADOS}** |
           | 🟡 Parcial (marca+modelo) | **${PARCIALES}** |
-          
+
           ## 👤 Vendedores
-          
+
           | Tipo | Cantidad |
           |------|----------|
           | 👤 Particulares | **${PARTICULARES}** |
           | 🏢 Agencias | **${AGENCIAS}** |
           | 🔥 Con urgencia | **${URGENCIA}** |
-          
+
           ## 📥 Descarga
-          
+
           La base de datos completa está disponible en los **Artifacts** del workflow.
-          
-          - **Nombre:** \`rosariogarage-master-db\`
+
+          - **Nombre:** \`rosariogarage-db\`
           - **Retención:** 90 días
-          
+
           ---
           *Ver logs del paso "Generar estadísticas detalladas" para más información*
           EOF
 
-  # ══════════════════════════════════════════════════════════════
-  # JOB 3: Limpieza de artifacts de workers
-  # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# JOB 3: Limpieza de artifacts de workers
+# ══════════════════════════════════════════════════════════════
+
   cleanup:
     name: 🧹 Limpieza
     runs-on: ubuntu-latest
@@ -470,9 +503,10 @@ jobs:
           name: worker-*-db
           failOnError: false
 
-  # ══════════════════════════════════════════════════════════════
-  # JOB 4: Notificación en caso de error
-  # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# JOB 4: Notificación en caso de error
+# ══════════════════════════════════════════════════════════════
+
   notify-failure:
     name: 🚨 Notificar Fallo
     runs-on: ubuntu-latest
@@ -484,19 +518,19 @@ jobs:
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           # ❌ Scraping Fallido
-          
+
           **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
-          
+
           El proceso de scraping ha fallado. Revisar los logs para más detalles.
-          
+
           ## 🔍 Pasos para diagnosticar:
-          
+
           1. Revisar logs de los workers individuales
           2. Verificar el paso "Organizar archivos de workers" en consolidación
           3. Comprobar si el sitio web está accesible
           4. Revisar límites de rate limiting
           5. Verificar que el catálogo de vehículos existe en config/
-          
+
           ---
           *El workflow se reintentará en la próxima ejecución programada*
           EOF
