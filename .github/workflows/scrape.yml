@@ -407,7 +407,7 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DASHBOARD_REPO_PAT }}
-          repository: TU_USUARIO/autos-dashboard   # ← cambiá esto
+          repository: Brunoact/Ros-Gar-Dash   # ← cambiá esto
           event-type: db-updated
           client-payload: |
             {
