@@ -127,6 +127,10 @@ jobs:
             echo "ℹ️ No existe BD maestra anterior (primera ejecución)"
           fi
 
+      # ── FIX: crear el directorio ANTES de descargar ──────────
+      - name: 📁 Crear directorio para workers
+        run: mkdir -p ./worker_downloads
+
       - name: 📥 Descargar BDs de todos los workers
         uses: actions/download-artifact@v4
         with:
@@ -134,14 +138,43 @@ jobs:
           path: ./worker_downloads/
           merge-multiple: false
 
+      # ── FIX: diagnóstico detallado antes de organizar ────────
+      - name: 🔎 Diagnóstico de artifacts descargados
+        run: |
+          echo "=== Contenido de worker_downloads ==="
+          if [ -d "./worker_downloads" ]; then
+            find ./worker_downloads -type f | sort || echo "Directorio vacío"
+            echo ""
+            echo "Estructura completa:"
+            ls -laR ./worker_downloads/ || echo "Vacío"
+          else
+            echo "❌ Directorio worker_downloads NO existe"
+            echo "Archivos en directorio actual:"
+            ls -la
+          fi
+
       - name: 📋 Organizar archivos de workers
         run: |
-          echo "=== Estructura de worker_downloads ==="
-          find ./worker_downloads -type f -name "*.db" -ls || echo "No hay archivos .db"
-
-          echo ""
           echo "=== Moviendo archivos al directorio raíz ==="
-          find ./worker_downloads -type f -name "rosariogarage_worker_*.db" -exec mv {} . \;
+
+          # Buscar .db en cualquier nivel de profundidad dentro de worker_downloads
+          FOUND_FILES=$(find ./worker_downloads -type f -name "rosariogarage_worker_*.db" 2>/dev/null)
+
+          if [ -z "$FOUND_FILES" ]; then
+            echo "⚠️ No se encontraron archivos con patrón rosariogarage_worker_*.db"
+            echo "Buscando cualquier .db descargado..."
+
+            # Fallback: mover cualquier .db que haya descargado
+            find ./worker_downloads -type f -name "*.db" 2>/dev/null | while read f; do
+              echo "  Encontrado: $f"
+              mv "$f" .
+            done
+          else
+            echo "$FOUND_FILES" | while read f; do
+              echo "  Moviendo: $f"
+              mv "$f" .
+            done
+          fi
 
           echo ""
           echo "=== Archivos .db en directorio actual ==="
@@ -150,7 +183,6 @@ jobs:
           echo ""
           echo "=== Verificación detallada de workers ==="
           FOUND=0
-          MISSING=0
           TOTAL_VEHICLES=0
 
           for i in {0..7}; do
@@ -163,7 +195,6 @@ jobs:
               TOTAL_VEHICLES=$((TOTAL_VEHICLES + COUNT))
             else
               echo "❌ Worker ${i}: NO ENCONTRADO"
-              MISSING=$((MISSING + 1))
             fi
           done
 
@@ -211,9 +242,9 @@ jobs:
               print(f"📅 Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
               print()
 
-              total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
-              activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
-              inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
+              total    = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+              activos  = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
+              inactivos= conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
 
               print(f"🚗 VEHÍCULOS")
               print(f"   Total en BD:     {format_number(total)}")
@@ -329,18 +360,18 @@ jobs:
               print("=" * 60)
 
               summary_data = {
-                  "total": total,
-                  "activos": activos,
-                  "nuevos_hoy": nuevos_hoy,
+                  "total":            total,
+                  "activos":          activos,
+                  "nuevos_hoy":       nuevos_hoy,
                   "actualizados_hoy": actualizados_hoy,
-                  "cambios_precio": cambios_precio_hoy,
-                  "normalizados": normalizados,
-                  "parciales": parciales,
-                  "particulares": particulares,
-                  "agencias": agencias,
-                  "con_urgencia": con_urgencia,
-                  "dolar_mep": float(metadata.get('last_dolar_mep', 0)),
-                  "workers": int(metadata.get('workers_consolidated', 0))
+                  "cambios_precio":   cambios_precio_hoy,
+                  "normalizados":     normalizados,
+                  "parciales":        parciales,
+                  "particulares":     particulares,
+                  "agencias":         agencias,
+                  "con_urgencia":     con_urgencia,
+                  "dolar_mep":        float(metadata.get('last_dolar_mep', 0)),
+                  "workers":          int(metadata.get('workers_consolidated', 0))
               }
 
               with open("summary.json", "w") as f:
@@ -368,9 +399,6 @@ jobs:
             echo "✅ Nuevo tamaño: $NEW_SIZE"
           fi
 
-      # ─────────────────────────────────────────────────────────
-      # Subir como artifact interno (para el próximo scrape)
-      # ─────────────────────────────────────────────────────────
       - name: 📤 Subir BD consolidada (uso interno scraper)
         uses: actions/upload-artifact@v4
         with:
@@ -380,34 +408,24 @@ jobs:
           compression-level: 9
           if-no-files-found: error
 
-      # ─────────────────────────────────────────────────────────
-      # NUEVO ① — Subir DB para el dashboard (nombre distinto
-      #            para que el repo 2 lo encuentre por workflow)
-      # ─────────────────────────────────────────────────────────
       - name: 📦 Subir DB para dashboard
         uses: actions/upload-artifact@v4
         with:
-          name: rosariogarage-db          # ← nombre que usa sync-db.yml
+          name: rosariogarage-db
           path: rosariogarage.db
           retention-days: 90
           compression-level: 9
           if-no-files-found: error
 
-      # ─────────────────────────────────────────────────────────
-      # NUEVO ② — Obtener fecha actual para el payload
-      # ─────────────────────────────────────────────────────────
       - name: 📅 Obtener fecha actual
         id: date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
-      # ─────────────────────────────────────────────────────────
-      # NUEVO ③ — Disparar deploy en repo dashboard
-      # ─────────────────────────────────────────────────────────
       - name: 🚀 Disparar deploy en repo dashboard
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DASHBOARD_REPO_PAT }}
-          repository: Brunoact/Ros-Gar-Dash   # ← cambiá esto
+          repository: Brunoact/Ros-Gar-Dash
           event-type: db-updated
           client-payload: |
             {
@@ -475,12 +493,12 @@ jobs:
           | 🏢 Agencias | **${AGENCIAS}** |
           | 🔥 Con urgencia | **${URGENCIA}** |
 
-          ## 📥 Descarga
+          ## 📥 Artifacts generados
 
-          La base de datos completa está disponible en los **Artifacts** del workflow.
-
-          - **Nombre:** \`rosariogarage-db\`
-          - **Retención:** 90 días
+          | Artifact | Uso | Retención |
+          |----------|-----|-----------|
+          | \`rosariogarage-master-db\` | Uso interno del scraper | 90 días |
+          | \`rosariogarage-db\` | Dashboard (Repo 2) | 90 días |
 
           ---
           *Ver logs del paso "Generar estadísticas detalladas" para más información*
@@ -525,8 +543,8 @@ jobs:
 
           ## 🔍 Pasos para diagnosticar:
 
-          1. Revisar logs de los workers individuales
-          2. Verificar el paso "Organizar archivos de workers" en consolidación
+          1. Revisar logs del paso "🔎 Diagnóstico de artifacts descargados"
+          2. Verificar el paso "📋 Organizar archivos de workers"
           3. Comprobar si el sitio web está accesible
           4. Revisar límites de rate limiting
           5. Verificar que el catálogo de vehículos existe en config/
