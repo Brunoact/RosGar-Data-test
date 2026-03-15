@@ -806,15 +806,12 @@ def consolidate():
     logger.info("=" * 60)
     logger.info("🔄 CONSOLIDACIÓN")
     logger.info("=" * 60)
-
     today = date.today().isoformat()
     workers = find_worker_databases()
-
     if not workers:
         fatal_error("Sin workers")
 
     logger.info(f"📊 Workers: {len(workers)}/{TOTAL_WORKERS}")
-
     all_data = []
     dolar = None
     stats = {'marca': 0, 'modelo': 0, 'full': 0, 'partial': 0}
@@ -823,10 +820,9 @@ def consolidate():
         vehicles, meta = read_worker_data(path)
         if vehicles:
             all_data.append((wid, vehicles, meta))
-            m = sum(1 for v in vehicles if v[3])  # marca
-            mo = sum(1 for v in vehicles if v[3] and v[4])  # marca+modelo
+            m = sum(1 for v in vehicles if v[3])
+            mo = sum(1 for v in vehicles if v[3] and v[4])
             logger.info(f"   Worker {wid}: {len(vehicles)} (marca: {m}, modelo: {mo})")
-
             if not dolar and 'dolar_mep' in meta:
                 dolar = float(meta['dolar_mep'])
             stats['marca'] += int(meta.get('with_marca', 0))
@@ -841,44 +837,42 @@ def consolidate():
     logger.info(f"\n📊 Total: {total} | Marca: {stats['marca']} | Modelo: {stats['modelo']}")
 
     init_master_db(MASTER_DB)
-    # ═══ Migración: reparar datos corruptos por bug de parámetros ═══
-    _conn = sqlite3.connect(MASTER_DB)
-    _conn.execute("UPDATE vehicles SET ultima_vista = primera_vista WHERE ultima_vista NOT LIKE '____-__-__'")
-    _conn.execute("UPDATE vehicles SET norm_status = 'unknown' WHERE norm_status LIKE '____-__-__'")
-    _conn.commit()
-    _conn.close()
-    logger.info("🔧 Migración: datos corruptos reparados")
-    cursor = conn.cursor()
 
+    # ═══ Single connection for migration + consolidation ═══
+    conn = sqlite3.connect(MASTER_DB)
+
+    # ═══ Migración: reparar datos corruptos ═══
+    conn.execute("UPDATE vehicles SET ultima_vista = primera_vista WHERE ultima_vista NOT LIKE '____-__-__'")
+    conn.execute("UPDATE vehicles SET norm_status = 'unknown' WHERE norm_status LIKE '____-__-__'")
+    conn.commit()
+    logger.info("🔧 Migración: datos corruptos reparados")
+
+    cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_scrape_date', today))
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_dolar_mep', str(dolar)))
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('workers_consolidated', str(len(all_data))))
 
     seen = set()
-
     for wid, vehicles, _ in all_data:
         for v in vehicles:
             vid = v[0]
             seen.add(vid)
             precio = v[10]
-
             existing = cursor.execute("SELECT precio_usd, primera_vista FROM vehicles WHERE id = ?", (vid,)).fetchone()
-
             if existing:
                 old_precio = existing[0]
                 cursor.execute("""
                     UPDATE vehicles SET
-                        url=?, fingerprint=?, marca=?, modelo=?, version=?,
-                        año=?, kilometros=?, transmision=?, combustible=?, precio_usd=?,
-                        es_particular=?, avisos_vendedor=?, whatsapp=?, ciudad=?, provincia=?,
-                        visitas=?, expira_dias=?, tiene_urgencia=?,
+                        url=?, fingerprint=?, marca=?, modelo=?, version=?, año=?,
+                        kilometros=?, transmision=?, combustible=?, precio_usd=?,
+                        es_particular=?, avisos_vendedor=?, whatsapp=?, ciudad=?,
+                        provincia=?, visitas=?, expira_dias=?, tiene_urgencia=?,
                         ultima_vista=?, activo=1,
                         dias_publicado=julianday(?)-julianday(primera_vista),
                         norm_status=?
                     WHERE id=?
                 """, (*v[1:19], today, today, v[19], vid))
                 STATS.vehicles_updated += 1
-
                 if old_precio and precio and abs(old_precio - precio) > 0.01:
                     var = ((precio - old_precio) / old_precio) * 100
                     cursor.execute("INSERT INTO price_history VALUES (NULL, ?, ?, ?, ?)",
@@ -888,21 +882,18 @@ def consolidate():
                 cursor.execute("""
                     INSERT INTO vehicles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
                 """, (*v[:19], today, today, v[19]))
-
                 if precio:
-                    cursor.execute("INSERT INTO price_history VALUES (NULL, ?, ?, ?, NULL)", (vid, precio, today))
+                    cursor.execute("INSERT INTO price_history VALUES (NULL, ?, ?, ?, NULL)",
+                                   (vid, precio, today))
                 STATS.vehicles_new += 1
 
-    # Inactivos
     if seen:
         ph = ','.join('?' * len(seen))
         cursor.execute(f"UPDATE vehicles SET activo=0 WHERE activo=1 AND id NOT IN ({ph})", tuple(seen))
 
-    # Purgar
     cursor.execute("DELETE FROM price_history WHERE vehicle_id IN (SELECT id FROM vehicles WHERE activo=0 AND ultima_vista < date('now', '-90 days'))")
     cursor.execute("DELETE FROM vehicles WHERE activo=0 AND ultima_vista < date('now', '-90 days')")
 
-    # Stats
     active = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1").fetchone()[0]
     with_marca = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1 AND marca IS NOT NULL").fetchone()[0]
     with_modelo = cursor.execute("SELECT COUNT(*) FROM vehicles WHERE activo=1 AND marca IS NOT NULL AND modelo IS NOT NULL").fetchone()[0]
@@ -911,7 +902,6 @@ def consolidate():
     conn.commit()
     conn.close()
 
-    # Limpiar
     for _, path in workers:
         try:
             os.remove(path)
@@ -927,7 +917,6 @@ def consolidate():
     logger.info(f"   📊 Activos: {active} | Marca: {with_marca} | Modelo: {with_modelo}")
     logger.info(f"   📈 Historial: {history}")
     logger.info("=" * 60)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 🚀 MAIN
