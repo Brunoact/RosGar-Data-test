@@ -870,7 +870,7 @@ def consolidate():
                         dias_publicado=julianday(?)-julianday(primera_vista),
                         norm_status=?
                     WHERE id=?
-                """, (*v[1:], today, today, vid))
+                """, (*v[1:19], today, today, v[19], vid))
                 STATS.vehicles_updated += 1
 
                 if old_precio and precio and abs(old_precio - precio) > 0.01:
