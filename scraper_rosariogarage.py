@@ -841,7 +841,13 @@ def consolidate():
     logger.info(f"\n📊 Total: {total} | Marca: {stats['marca']} | Modelo: {stats['modelo']}")
 
     init_master_db(MASTER_DB)
-    conn = sqlite3.connect(MASTER_DB)
+    # ═══ Migración: reparar datos corruptos por bug de parámetros ═══
+    _conn = sqlite3.connect(MASTER_DB)
+    _conn.execute("UPDATE vehicles SET ultima_vista = primera_vista WHERE ultima_vista NOT LIKE '____-__-__'")
+    _conn.execute("UPDATE vehicles SET norm_status = 'unknown' WHERE norm_status LIKE '____-__-__'")
+    _conn.commit()
+    _conn.close()
+    logger.info("🔧 Migración: datos corruptos reparados")
     cursor = conn.cursor()
 
     cursor.execute("INSERT OR REPLACE INTO scrape_metadata VALUES (?, ?)", ('last_scrape_date', today))
