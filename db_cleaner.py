@@ -1,19 +1,14 @@
 """
-🧹 db_cleaner.py - Corrección de BD con Estrategias A y B
-==========================================================
+🧹 db_cleaner.py v1.1 - Corrección de BD (Estrategias A + B)
+=============================================================
 
-Lee rosariogarage.db y corrige errores de normalización usando
-normalizer_v2 SIN necesidad de red (datos ya existentes en BD).
+ESTRATEGIA A: Validación año → modelo (con tolerancia ±2)
+  - Holgura de ±2 años antes de cambiar modelo
+  - Detección de año basura (>10 años fuera de rango, futuro, etc.)
+  - Si año es basura → no cambiar modelo, opcionalmente nullificar año
 
-ESTRATEGIA A: Validación por año
-  - Si marca+modelo+año existen pero el año cae fuera del rango
-    de producción del modelo → busca sucesor/predecesor en succession_map
-  - Ejemplo: Peugeot 206 año 2015 → corrige a 208
-
-ESTRATEGIA B: Mapeo de códigos atrapados como modelo
-  - Si el modelo es un código (c200, 320i, gla200) → mapea al nombre
-    de catálogo (clase c, serie 3, clase gla)
-  - Ejemplo: Mercedes-Benz modelo="c200" → modelo="clase c"
+ESTRATEGIA B: Mapeo de códigos → nombre de catálogo
+  - c200 → clase c, 320i → serie 3, gla200 → clase gla
 
 USO:
   python db_cleaner.py                      # Ejecutar corrección
@@ -29,14 +24,13 @@ import logging
 import sys
 import os
 import re
-import json
-from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from collections import Counter
 
 # ═══════════════════════════════════════════════════════════════
-# 📦 IMPORT NORMALIZER V2
+# 📦 IMPORTS
 # ═══════════════════════════════════════════════════════════════
 
 try:
@@ -53,6 +47,13 @@ DEFAULT_DB = 'rosariogarage.db'
 BACKUP_SUFFIX = '_nofix'
 CHANGELOG_TABLE = 'normalization_changelog'
 
+# ── Tolerancia de año ──
+YEAR_TOLERANCE = 2          # ±2 años antes de cambiar modelo
+YEAR_GARBAGE_THRESHOLD = 10 # >10 años fuera = año basura
+CURRENT_YEAR = datetime.now().year
+YEAR_MAX_VALID = CURRENT_YEAR + 1
+YEAR_MIN_VALID = 1940
+
 # ═══════════════════════════════════════════════════════════════
 # 📊 ESTADÍSTICAS
 # ═══════════════════════════════════════════════════════════════
@@ -66,69 +67,69 @@ class CleanerStats:
     year_issues_found: int = 0
     year_fixes_applied: int = 0
     year_no_suggestion: int = 0
+    year_within_tolerance: int = 0
+    year_garbage_detected: int = 0
+    year_nullified: int = 0
 
     # Estrategia B
     code_issues_found: int = 0
     code_fixes_applied: int = 0
 
-    # Alias de marca
+    # Alias
     marca_alias_fixed: int = 0
 
     # General
     total_fixes: int = 0
-    skipped: int = 0
     errors: int = 0
 
     def summary(self) -> str:
         return (
             f"Analizados: {self.analyzed}/{self.total_vehicles}\n"
-            f"  Estrategia A (año→modelo): {self.year_fixes_applied} fixes "
-            f"({self.year_issues_found} detectados, "
-            f"{self.year_no_suggestion} sin sugerencia)\n"
-            f"  Estrategia B (código→nombre): {self.code_fixes_applied} fixes "
-            f"({self.code_issues_found} detectados)\n"
+            f"  Estrategia A (año→modelo):\n"
+            f"    - Detectados fuera de rango: {self.year_issues_found}\n"
+            f"    - Dentro de tolerancia ±{YEAR_TOLERANCE} (no tocados): "
+            f"{self.year_within_tolerance}\n"
+            f"    - Año basura (>±{YEAR_GARBAGE_THRESHOLD}): "
+            f"{self.year_garbage_detected}\n"
+            f"    - Años nullificados: {self.year_nullified}\n"
+            f"    - Modelo corregido: {self.year_fixes_applied}\n"
+            f"    - Sin sugerencia: {self.year_no_suggestion}\n"
+            f"  Estrategia B (código→nombre): "
+            f"{self.code_fixes_applied}/{self.code_issues_found}\n"
             f"  Alias de marca: {self.marca_alias_fixed}\n"
-            f"  Total fixes aplicados: {self.total_fixes}\n"
-            f"  Errores: {self.errors}"
+            f"  Total fixes: {self.total_fixes} | "
+            f"Errores: {self.errors}"
         )
 
 
 STATS = CleanerStats()
 
+logger = logging.getLogger(__name__)
+
+
 # ═══════════════════════════════════════════════════════════════
-# 🔧 LOGGING
+# 🛠️ HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose=False):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format='%(asctime)s │ %(levelname)-7s │ %(message)s',
         datefmt='%H:%M:%S'
     )
-    return logging.getLogger(__name__)
 
-
-logger = setup_logging()
-
-# ═══════════════════════════════════════════════════════════════
-# 🛠️ HELPERS
-# ═══════════════════════════════════════════════════════════════
 
 def create_backup(db_path: str) -> str:
-    """
-    Copia la BD original a rosariogarage_nofix.db
-    """
     base, ext = os.path.splitext(db_path)
     backup_path = f"{base}{BACKUP_SUFFIX}{ext}"
     shutil.copy2(db_path, backup_path)
     size_mb = os.path.getsize(backup_path) / (1024 * 1024)
-    logger.info(f"💾 Backup creado: {backup_path} ({size_mb:.1f} MB)")
+    logger.info(f"💾 Backup: {backup_path} ({size_mb:.1f} MB)")
     return backup_path
 
 
-def setup_changelog(conn: sqlite3.Connection):
-    """Crea tabla de changelog para auditoría."""
+def setup_changelog(conn):
     conn.executescript(f"""
         CREATE TABLE IF NOT EXISTS {CHANGELOG_TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,72 +144,129 @@ def setup_changelog(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_cl_vehicle
             ON {CHANGELOG_TABLE}(vehicle_id);
-        CREATE INDEX IF NOT EXISTS idx_cl_estrategia
-            ON {CHANGELOG_TABLE}(estrategia);
     """)
     conn.commit()
 
 
-def log_change(conn: sqlite3.Connection, vehicle_id: str, campo: str,
-               old_val: Any, new_val: Any, estrategia: str,
-               razon: str, confidence: int = 0):
-    """Registra un cambio en el changelog."""
+def log_change(conn, vid, campo, old, new, estrategia, razon,
+               confidence=0):
     conn.execute(f"""
         INSERT INTO {CHANGELOG_TABLE}
         (vehicle_id, campo, valor_anterior, valor_nuevo,
          estrategia, razon, confidence)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        vehicle_id, campo,
-        str(old_val) if old_val else None,
-        str(new_val) if new_val else None,
-        estrategia, razon, confidence
-    ))
+    """, (vid, campo,
+          str(old) if old else None,
+          str(new) if new else None,
+          estrategia, razon, confidence))
 
 
-def read_all_vehicles(conn: sqlite3.Connection) -> List[Dict]:
-    """Lee todos los vehículos de la BD."""
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("""
-        SELECT id, url, marca, modelo, version, año,
-               kilometros, norm_status, activo
-        FROM vehicles
-        ORDER BY id
-    """).fetchall()
-    return [dict(r) for r in rows]
-
-
-def normalize_key(text: str) -> str:
-    """Normaliza texto para comparación."""
+def normalize_key(text):
     if not text:
         return ""
     return text.lower().strip()
 
+
+def read_all_vehicles(conn):
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT id, url, marca, modelo, version, año,
+               kilometros, norm_status, activo
+        FROM vehicles ORDER BY id
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ═══════════════════════════════════════════════════════════════
-# 🅰️ ESTRATEGIA A: VALIDACIÓN POR AÑO
+# 📅 AÑO BASURA (NUEVO v1.1)
 # ═══════════════════════════════════════════════════════════════
 
-def check_year_range(catalog, marca: str, modelo: str, año: int
-                     ) -> Optional[Dict]:
+def is_year_garbage(año, km=None):
     """
-    Verifica si el año está dentro del rango del modelo.
+    Detecta año basura SIN necesidad de catálogo.
+    Para validación rápida antes de buscar en catálogo.
+    """
+    if not año:
+        return False, None
 
-    Returns:
-        None si está OK o no hay datos para verificar
-        Dict con 'suggestion', 'desde', 'hasta', 'razon' si hay problema
+    # Futuro
+    if año > YEAR_MAX_VALID:
+        return True, f"Año {año} es futuro (máx: {YEAR_MAX_VALID})"
+
+    # Muy antiguo
+    if año < YEAR_MIN_VALID:
+        return True, f"Año {año} < {YEAR_MIN_VALID}"
+
+    # Km altos + año actual/futuro
+    if km and km > 50000 and año >= CURRENT_YEAR:
+        return True, (
+            f"Año {año} con {km:,} km es imposible"
+        )
+
+    return False, None
+
+
+def is_year_garbage_for_model(año, model_range):
+    """
+    Detecta año basura respecto al rango del modelo.
+    Retorna (is_garbage, distance, reason).
+    """
+    if not año or not model_range:
+        return False, 0, None
+
+    desde = model_range.get('desde', 0)
+    hasta = model_range.get('hasta', 9999)
+
+    if desde <= año <= hasta:
+        return False, 0, None
+
+    if año < desde:
+        distance = desde - año
+    else:
+        distance = año - hasta
+
+    if distance > YEAR_GARBAGE_THRESHOLD:
+        return True, distance, (
+            f"Año {año} a {distance} años del rango "
+            f"{desde}-{hasta} (umbral: {YEAR_GARBAGE_THRESHOLD})"
+        )
+
+    return False, distance, None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🅰️ ESTRATEGIA A: VALIDACIÓN POR AÑO (con tolerancia)
+# ═══════════════════════════════════════════════════════════════
+
+def check_year_range(catalog, marca, modelo, año, km=None):
+    """
+    Verifica año vs rango del modelo CON TOLERANCIA.
+
+    Returns None si OK, o Dict con resultado:
+      - action: 'keep' | 'correct' | 'garbage' | 'no_suggestion'
+      - suggestion: modelo sugerido (si action='correct')
+      - reason: explicación
     """
     if not año or not marca or not modelo:
         return None
 
     marca_resolved = catalog.resolve_brand(marca)
 
-    # Verificar que la marca y modelo existen en catálogo
     if not catalog.has_brand(marca_resolved):
         return None
     if not catalog.has_model(marca_resolved, modelo):
         return None
 
-    # Obtener rango de años
+    # ── Año basura absoluto (futuro, etc.) ──
+    garbage, reason = is_year_garbage(año, km)
+    if garbage:
+        return {
+            'action': 'garbage',
+            'suggestion': None,
+            'reason': reason,
+        }
+
+    # ── Verificar rango del modelo ──
     yr = catalog.get_year_range(marca_resolved, modelo)
     if not yr:
         return None
@@ -216,118 +274,115 @@ def check_year_range(catalog, marca: str, modelo: str, año: int
     desde = yr.get('desde', 0)
     hasta = yr.get('hasta', 9999)
 
-    # Si el año está dentro del rango, todo OK
+    # Dentro del rango real → OK
     if desde <= año <= hasta:
         return None
 
-    # ── Año fuera de rango → buscar sugerencia ──
-    result = {
-        'desde': desde,
-        'hasta': hasta,
-        'suggestion': None,
-        'suggestion_range': None,
-        'razon': None,
-    }
+    # Dentro de la tolerancia → KEEP (no tocar)
+    desde_tol = desde - YEAR_TOLERANCE
+    hasta_tol = hasta + YEAR_TOLERANCE
 
-    # Intentar con get_year_suggestion del catálogo
-    suggestion = catalog.get_year_suggestion(marca_resolved, modelo, año)
+    if desde_tol <= año <= hasta_tol:
+        return {
+            'action': 'keep',
+            'suggestion': None,
+            'reason': (
+                f"Año {año} fuera de {desde}-{hasta} pero "
+                f"dentro de tolerancia ±{YEAR_TOLERANCE}"
+            ),
+        }
+
+    # ── Verificar si es basura para este modelo ──
+    garbage_model, distance, reason = is_year_garbage_for_model(año, yr)
+    if garbage_model:
+        return {
+            'action': 'garbage',
+            'suggestion': None,
+            'reason': reason,
+        }
+
+    # ── Buscar sucesor/predecesor ──
+    # Caminar la cadena buscando modelo donde el año
+    # caiga DENTRO del rango real (sin tolerancia)
+
+    if año > hasta:
+        suggestion = _walk_successors(
+            catalog, marca_resolved, modelo, año
+        )
+    else:
+        suggestion = _walk_predecessors(
+            catalog, marca_resolved, modelo, año
+        )
 
     if suggestion:
-        # Verificar que la sugerencia existe y cubre el año
-        if catalog.has_model(marca_resolved, suggestion):
-            sug_yr = catalog.get_year_range(marca_resolved, suggestion)
-            if sug_yr:
-                sug_desde = sug_yr.get('desde', 0)
-                sug_hasta = sug_yr.get('hasta', 9999)
-                if sug_desde <= año <= sug_hasta:
-                    result['suggestion'] = suggestion
-                    result['suggestion_range'] = (sug_desde, sug_hasta)
-                    result['razon'] = (
-                        f"'{modelo}' existió {desde}-{hasta}, "
-                        f"año {año} corresponde a '{suggestion}' "
-                        f"({sug_desde}-{sug_hasta})"
-                    )
-                    return result
+        sug_yr = catalog.get_year_range(marca_resolved, suggestion)
+        sd = sug_yr.get('desde', 0) if sug_yr else '?'
+        sh = sug_yr.get('hasta', 9999) if sug_yr else '?'
+        return {
+            'action': 'correct',
+            'suggestion': suggestion,
+            'reason': (
+                f"'{modelo}' existió {desde}-{hasta}, "
+                f"año {año} → '{suggestion}' ({sd}-{sh})"
+            ),
+        }
 
-    # Intentar succession_map directamente
-    if año > hasta:
-        # Año posterior → buscar sucesor
-        sucesor = catalog.get_successor(marca_resolved, modelo)
-        if sucesor and catalog.has_model(marca_resolved, sucesor):
-            suc_yr = catalog.get_year_range(marca_resolved, sucesor)
-            if suc_yr:
-                suc_desde = suc_yr.get('desde', 0)
-                suc_hasta = suc_yr.get('hasta', 9999)
-                if suc_desde <= año <= suc_hasta:
-                    result['suggestion'] = sucesor
-                    result['suggestion_range'] = (suc_desde, suc_hasta)
-                    result['razon'] = (
-                        f"'{modelo}' existió {desde}-{hasta}, "
-                        f"año {año} → sucesor '{sucesor}' "
-                        f"({suc_desde}-{suc_hasta})"
-                    )
-                    return result
+    return {
+        'action': 'no_suggestion',
+        'suggestion': None,
+        'reason': (
+            f"Año {año} fuera de {desde}-{hasta} para '{modelo}', "
+            f"sin sucesor/predecesor que cubra ese año"
+        ),
+    }
 
-                # Quizás hay un sucesor del sucesor
-                sucesor2 = catalog.get_successor(marca_resolved, sucesor)
-                if sucesor2 and catalog.has_model(marca_resolved, sucesor2):
-                    suc2_yr = catalog.get_year_range(
-                        marca_resolved, sucesor2
-                    )
-                    if suc2_yr:
-                        s2d = suc2_yr.get('desde', 0)
-                        s2h = suc2_yr.get('hasta', 9999)
-                        if s2d <= año <= s2h:
-                            result['suggestion'] = sucesor2
-                            result['suggestion_range'] = (s2d, s2h)
-                            result['razon'] = (
-                                f"'{modelo}' existió {desde}-{hasta}, "
-                                f"año {año} → sucesor² '{sucesor2}' "
-                                f"({s2d}-{s2h})"
-                            )
-                            return result
 
-    elif año < desde:
-        # Año anterior → buscar predecesor
-        predecesor = catalog.get_predecessor(marca_resolved, modelo)
-        if predecesor and catalog.has_model(marca_resolved, predecesor):
-            pred_yr = catalog.get_year_range(marca_resolved, predecesor)
-            if pred_yr:
-                pred_desde = pred_yr.get('desde', 0)
-                pred_hasta = pred_yr.get('hasta', 9999)
-                if pred_desde <= año <= pred_hasta:
-                    result['suggestion'] = predecesor
-                    result['suggestion_range'] = (pred_desde, pred_hasta)
-                    result['razon'] = (
-                        f"'{modelo}' existió {desde}-{hasta}, "
-                        f"año {año} → predecesor '{predecesor}' "
-                        f"({pred_desde}-{pred_hasta})"
-                    )
-                    return result
+def _walk_successors(catalog, marca, modelo, año, max_depth=5):
+    current = modelo
+    visited = {current}
+    for _ in range(max_depth):
+        sucesor = catalog.get_successor(marca, current)
+        if not sucesor or sucesor in visited:
+            break
+        visited.add(sucesor)
+        if catalog.has_model(marca, sucesor):
+            syr = catalog.get_year_range(marca, sucesor)
+            if syr:
+                sd = syr.get('desde', 0)
+                sh = syr.get('hasta', 9999)
+                if sd <= año <= sh:
+                    return sucesor
+        current = sucesor
+    return None
 
-    # Año fuera de rango pero sin sugerencia válida
-    result['razon'] = (
-        f"'{modelo}' existió {desde}-{hasta}, "
-        f"año {año} fuera de rango, sin sugerencia encontrada"
-    )
-    return result
+
+def _walk_predecessors(catalog, marca, modelo, año, max_depth=5):
+    current = modelo
+    visited = {current}
+    for _ in range(max_depth):
+        pred = catalog.get_predecessor(marca, current)
+        if not pred or pred in visited:
+            break
+        visited.add(pred)
+        if catalog.has_model(marca, pred):
+            pyr = catalog.get_year_range(marca, pred)
+            if pyr:
+                pd = pyr.get('desde', 0)
+                ph = pyr.get('hasta', 9999)
+                if pd <= año <= ph:
+                    return pred
+        current = pred
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🅱️ ESTRATEGIA B: MAPEO DE CÓDIGOS
 # ═══════════════════════════════════════════════════════════════
 
-def check_code_mapping(catalog, marca: str, modelo: str
-                       ) -> Optional[Dict]:
+def check_code_mapping(catalog, marca, modelo):
     """
-    Verifica si el modelo actual es un código que debería
-    mapearse a un nombre de catálogo.
-
-    Ejemplo: marca="mercedes-benz", modelo="c200"
-             → modelo debería ser "clase c"
-
-    Returns:
-        None si no hay mapeo necesario
-        Dict con 'mapped_model', 'razon' si hay corrección
+    Si el modelo es un código → mapear a nombre de catálogo.
+    Ejemplo: "c200" → "clase c"
     """
     if not marca or not modelo:
         return None
@@ -335,67 +390,60 @@ def check_code_mapping(catalog, marca: str, modelo: str
     marca_resolved = catalog.resolve_brand(marca)
     modelo_norm = normalize_key(modelo)
 
-    # Si el modelo YA existe en el catálogo, no tocar
     if catalog.has_model(marca_resolved, modelo_norm):
         return None
 
-    # Obtener code_mappings para esta marca
     code_mappings = catalog.code_mappings.get(
         normalize_key(marca_resolved), {}
     )
     if not code_mappings:
         return None
 
-    # ── Intentar match exacto del modelo como código ──
+    # Match exacto del modelo como código
     if modelo_norm in code_mappings:
         mapped = code_mappings[modelo_norm]
-        # Resolver si es dict (ambiguo) o string
         if isinstance(mapped, dict):
             if mapped.get('ambiguo'):
-                # No corregir si es ambiguo
                 return None
             mapped_model = mapped.get('modelos', [None])[0]
         else:
             mapped_model = mapped
 
-        if mapped_model and catalog.has_model(marca_resolved, mapped_model):
+        if mapped_model and catalog.has_model(
+            marca_resolved, mapped_model
+        ):
             return {
                 'mapped_model': mapped_model,
-                'razon': (
-                    f"Código '{modelo}' mapeado a '{mapped_model}' "
-                    f"en catálogo de {marca_resolved}"
-                )
+                'reason': (
+                    f"Código '{modelo}' → '{mapped_model}'"
+                ),
             }
 
-    # ── Intentar extraer prefijo del modelo ──
-    # Ej: "c200" → prefijo "c", "gla200" → prefijo "gla"
-    # Ej: "320i" → prefijo "3"
-    prefixes_to_try = []
+    # Extraer prefijo
+    prefixes = []
 
-    # Patrón: letras + números (c200, gla250, cls350)
+    # letras+números: c200, gla250
     m = re.match(r'^([a-z]+)[\s\-]?(\d+)', modelo_norm)
     if m:
-        prefixes_to_try.append(m.group(1))
-        # También intentar con el número completo como código
-        prefixes_to_try.append(f"{m.group(1)}{m.group(2)}")
+        prefixes.append(m.group(1))
+        prefixes.append(f"{m.group(1)}{m.group(2)}")
 
-    # Patrón: número + letra (320i, 520d)
+    # número+letra: 320i
     m = re.match(r'^(\d)(\d{2})[a-z]?$', modelo_norm)
     if m:
-        prefixes_to_try.append(m.group(1))
+        prefixes.append(m.group(1))
 
-    # Patrón: x + número (x1, x3, x5)
+    # x1, m3, z4, rs3, etc
     m = re.match(r'^(x\d|m\d|z\d|i\d|rs\d|ix\d?)', modelo_norm)
     if m:
-        prefixes_to_try.append(m.group(1))
+        prefixes.append(m.group(1))
 
-    # Patrón: a1, a3, q5, s3, tt, etc
+    # a1, q5, s3, tt
     m = re.match(r'^([aqst]{1,2}\d?)', modelo_norm)
     if m:
-        prefixes_to_try.append(m.group(1))
+        prefixes.append(m.group(1))
 
-    # Intentar cada prefijo
-    for prefix in prefixes_to_try:
+    for prefix in prefixes:
         if prefix in code_mappings:
             mapped = code_mappings[prefix]
             if isinstance(mapped, dict):
@@ -405,33 +453,31 @@ def check_code_mapping(catalog, marca: str, modelo: str
             else:
                 mapped_model = mapped
 
-            if (mapped_model
-                    and catalog.has_model(marca_resolved, mapped_model)):
+            if mapped_model and catalog.has_model(
+                marca_resolved, mapped_model
+            ):
                 return {
                     'mapped_model': mapped_model,
-                    'razon': (
+                    'reason': (
                         f"Código '{modelo}' (prefijo '{prefix}') "
-                        f"mapeado a '{mapped_model}'"
-                    )
+                        f"→ '{mapped_model}'"
+                    ),
                 }
 
     return None
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🔄 PROCESO PRINCIPAL
 # ═══════════════════════════════════════════════════════════════
 
-def process_vehicle(v: Dict, catalog, conn: sqlite3.Connection,
-                    dry_run: bool = False) -> List[Dict]:
-    """
-    Procesa un vehículo aplicando Estrategias A y B.
-    Retorna lista de cambios aplicados.
-    """
+def process_vehicle(v, catalog, conn, dry_run=False):
     vid = v['id']
     marca = normalize_key(v.get('marca') or '')
     modelo = normalize_key(v.get('modelo') or '')
     version = v.get('version') or ''
     año = v.get('año')
+    km = v.get('kilometros')
     changes = []
 
     if not marca:
@@ -441,11 +487,9 @@ def process_vehicle(v: Dict, catalog, conn: sqlite3.Connection,
     marca_resolved = catalog.resolve_brand(marca)
     if marca_resolved != marca and catalog.has_brand(marca_resolved):
         changes.append({
-            'campo': 'marca',
-            'old': marca,
-            'new': marca_resolved,
+            'campo': 'marca', 'old': marca, 'new': marca_resolved,
             'estrategia': 'alias_marca',
-            'razon': f"Alias de marca: '{marca}' → '{marca_resolved}'",
+            'reason': f"Alias: '{marca}' → '{marca_resolved}'",
             'confidence': 95,
         })
         marca = marca_resolved
@@ -454,55 +498,82 @@ def process_vehicle(v: Dict, catalog, conn: sqlite3.Connection,
     if not modelo:
         return changes
 
-    # ── ESTRATEGIA B: Mapeo de código (primero) ──
-    # Se ejecuta ANTES de A porque si el modelo es un código,
-    # primero lo mapeamos y luego validamos el año
+    # ── PASO 1: Detectar año basura ──
+    año_is_garbage = False
+    if año:
+        garbage, reason = is_year_garbage(año, km)
+        if garbage:
+            año_is_garbage = True
+            STATS.year_garbage_detected += 1
+            changes.append({
+                'campo': 'año', 'old': año, 'new': None,
+                'estrategia': 'year_garbage',
+                'reason': f"Año basura: {reason}",
+                'confidence': 90,
+            })
+            STATS.year_nullified += 1
+            logger.debug(f"  🗑️ [{vid}] {reason}")
+
+    # ── PASO 2: Estrategia B (código→nombre) ──
     code_result = check_code_mapping(catalog, marca, modelo)
     if code_result:
         STATS.code_issues_found += 1
         mapped = code_result['mapped_model']
         changes.append({
-            'campo': 'modelo',
-            'old': modelo,
-            'new': mapped,
+            'campo': 'modelo', 'old': modelo, 'new': mapped,
             'estrategia': 'B_code_mapping',
-            'razon': code_result['razon'],
+            'reason': code_result['reason'],
             'confidence': 90,
         })
-        # Actualizar modelo para que la Estrategia A use el correcto
         modelo = mapped
         STATS.code_fixes_applied += 1
 
-    # ── ESTRATEGIA A: Validación por año ──
-    if año:
-        year_result = check_year_range(catalog, marca, modelo, año)
+    # ── PASO 3: Estrategia A (año→modelo, con tolerancia) ──
+    if año and not año_is_garbage:
+        year_result = check_year_range(
+            catalog, marca, modelo, año, km
+        )
         if year_result:
-            STATS.year_issues_found += 1
-            if year_result.get('suggestion'):
+            action = year_result['action']
+
+            if action == 'keep':
+                STATS.year_within_tolerance += 1
+                logger.debug(
+                    f"  ✅ [{vid}] {year_result['reason']}"
+                )
+
+            elif action == 'correct':
+                STATS.year_issues_found += 1
                 suggestion = year_result['suggestion']
                 changes.append({
                     'campo': 'modelo',
                     'old': modelo,
                     'new': suggestion,
                     'estrategia': 'A_year_validation',
-                    'razon': year_result['razon'],
+                    'reason': year_result['reason'],
                     'confidence': 85,
                 })
                 STATS.year_fixes_applied += 1
-            else:
+
+            elif action == 'garbage':
+                STATS.year_garbage_detected += 1
+                changes.append({
+                    'campo': 'año', 'old': año, 'new': None,
+                    'estrategia': 'year_garbage_model',
+                    'reason': year_result['reason'],
+                    'confidence': 85,
+                })
+                STATS.year_nullified += 1
+
+            elif action == 'no_suggestion':
+                STATS.year_issues_found += 1
                 STATS.year_no_suggestion += 1
                 logger.debug(
-                    f"  ⚠️ [{vid}] Año fuera de rango sin sugerencia: "
-                    f"{year_result['razon']}"
+                    f"  ⚠️ [{vid}] {year_result['reason']}"
                 )
 
     # ── Aplicar cambios ──
     if changes and not dry_run:
-        for change in changes:
-            # Si hay múltiples cambios al mismo campo, usar el último
-            pass
-
-        # Consolidar: tomar el último valor de cada campo
         final_values = {}
         for change in changes:
             campo = change['campo']
@@ -510,51 +581,56 @@ def process_vehicle(v: Dict, catalog, conn: sqlite3.Connection,
             log_change(
                 conn, vid, campo,
                 change['old'], change['new'],
-                change['estrategia'], change['razon'],
+                change['estrategia'], change['reason'],
                 change['confidence']
             )
 
-        # Determinar nuevo norm_status
+        # Recalcular norm_status
         new_marca = final_values.get('marca', marca)
         new_modelo = final_values.get('modelo', modelo)
 
-        if catalog.has_model(new_marca, new_modelo):
+        if new_modelo and catalog.has_model(new_marca, new_modelo):
             versions = catalog.get_versions(new_marca, new_modelo)
-            # Verificar si la versión actual matchea
             version_norm = normalize_key(version)
-            has_version = version_norm in [
+            has_ver = version_norm in [
                 normalize_key(v) for v in versions
             ] if versions else False
-            new_status = 'full_match' if has_version else 'partial_match'
+            final_values['norm_status'] = (
+                'full_match' if has_ver else 'partial_match'
+            )
         else:
-            new_status = 'fallback'
+            final_values['norm_status'] = 'fallback'
 
-        final_values['norm_status'] = new_status
-
-        # Ejecutar UPDATE
         sets = ', '.join(f"{k} = ?" for k in final_values)
         vals = list(final_values.values()) + [vid]
         conn.execute(
             f"UPDATE vehicles SET {sets} WHERE id = ?", vals
         )
+        STATS.total_fixes += len(changes)
 
     return changes
 
 
-def run_cleaner(db_path: str, dry_run: bool = False,
-                dicts_path: str = 'config/normalizer_dicts.json'):
-    """Ejecuta el proceso completo de limpieza."""
+# ═══════════════════════════════════════════════════════════════
+# 🚀 RUN
+# ═══════════════════════════════════════════════════════════════
+
+def run_cleaner(db_path, dry_run=False,
+                dicts_path='config/normalizer_dicts.json'):
     global STATS
     STATS = CleanerStats()
 
     logger.info("🧹 " + "=" * 58)
-    logger.info("🧹 DB CLEANER - Estrategias A + B")
+    logger.info("🧹 DB CLEANER v1.1 — Estrategias A + B")
     logger.info("🧹 " + "=" * 58)
+    logger.info(
+        f"   Tolerancia de año: ±{YEAR_TOLERANCE} | "
+        f"Umbral basura: ±{YEAR_GARBAGE_THRESHOLD}"
+    )
 
     if dry_run:
-        logger.info("⚡ MODO DRY-RUN: No se aplicarán cambios")
+        logger.info("   ⚡ MODO DRY-RUN")
 
-    # ── Verificar BD ──
     if not os.path.exists(db_path):
         logger.error(f"❌ BD no encontrada: {db_path}")
         sys.exit(1)
@@ -562,200 +638,138 @@ def run_cleaner(db_path: str, dry_run: bool = False,
     size_mb = os.path.getsize(db_path) / (1024 * 1024)
     logger.info(f"📂 BD: {db_path} ({size_mb:.1f} MB)")
 
-    # ── Verificar normalizer_v2 ──
     if not HAS_NV2:
         logger.error("❌ normalizer_v2.py no encontrado")
         sys.exit(1)
 
-    # ── Inicializar catálogo ──
     loaded = nv2.init_normalizer(dicts_path=dicts_path)
     if not loaded:
-        logger.error(f"❌ No se pudo cargar catálogo: {dicts_path}")
+        logger.error(f"❌ Catálogo no cargado: {dicts_path}")
         sys.exit(1)
-
     catalog = nv2.get_catalog()
     logger.info("✅ Catálogo cargado")
 
-    # ── Backup ──
     if not dry_run:
-        backup_path = create_backup(db_path)
+        create_backup(db_path)
 
-    # ── Conectar BD ──
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     setup_changelog(conn)
 
-    # ── Leer vehículos ──
     vehicles = read_all_vehicles(conn)
     STATS.total_vehicles = len(vehicles)
-    logger.info(f"📊 Vehículos en BD: {len(vehicles)}")
+    logger.info(f"📊 Vehículos: {len(vehicles)}")
 
-    # ── Contar estado actual ──
-    with_marca = sum(1 for v in vehicles if v.get('marca'))
-    with_modelo = sum(1 for v in vehicles if v.get('modelo'))
-    with_year = sum(1 for v in vehicles if v.get('año'))
-
-    logger.info(f"   Con marca: {with_marca}")
-    logger.info(f"   Con modelo: {with_modelo}")
-    logger.info(f"   Con año: {with_year}")
-
-    # ── Procesar ──
-    logger.info(f"\n{'─' * 60}")
-    logger.info("🔄 PROCESANDO VEHÍCULOS...")
-    logger.info(f"{'─' * 60}")
-
-    all_changes = []
-    batch_size = 500
     examples_a = []
     examples_b = []
-    examples_alias = []
+    examples_garbage = []
+    examples_tolerance = []
 
+    batch_size = 500
     for i in range(0, len(vehicles), batch_size):
         batch = vehicles[i:i + batch_size]
-
         for v in batch:
             STATS.analyzed += 1
             try:
                 changes = process_vehicle(v, catalog, conn, dry_run)
-                if changes:
-                    STATS.total_fixes += len(changes)
-                    all_changes.extend(
-                        [{'vehicle_id': v['id'], **c} for c in changes]
-                    )
-
-                    # Guardar ejemplos
-                    for c in changes:
-                        example = {
-                            'id': v['id'],
-                            'año': v.get('año'),
-                            **c
-                        }
-                        if (c['estrategia'] == 'A_year_validation'
-                                and len(examples_a) < 10):
-                            examples_a.append(example)
-                        elif (c['estrategia'] == 'B_code_mapping'
-                                and len(examples_b) < 10):
-                            examples_b.append(example)
-                        elif (c['estrategia'] == 'alias_marca'
-                                and len(examples_alias) < 5):
-                            examples_alias.append(example)
-
+                for c in changes:
+                    ex = {'id': v['id'], 'año': v.get('año'), **c}
+                    if (c['estrategia'] == 'A_year_validation'
+                            and len(examples_a) < 10):
+                        examples_a.append(ex)
+                    elif (c['estrategia'] == 'B_code_mapping'
+                            and len(examples_b) < 10):
+                        examples_b.append(ex)
+                    elif ('garbage' in c['estrategia']
+                            and len(examples_garbage) < 10):
+                        examples_garbage.append(ex)
             except Exception as e:
                 STATS.errors += 1
-                logger.debug(f"Error procesando {v['id']}: {e}")
+                logger.debug(f"Error {v['id']}: {e}")
 
         if not dry_run:
             conn.commit()
 
         processed = min(i + batch_size, len(vehicles))
-        fixes_so_far = STATS.total_fixes
         logger.info(
-            f"   {processed}/{len(vehicles)} | Fixes: {fixes_so_far}"
+            f"   {processed}/{len(vehicles)} | "
+            f"Fixes: {STATS.total_fixes}"
         )
 
     if not dry_run:
         conn.commit()
 
-    # ═══════════════════════════════════════════════════════
-    # 📊 REPORTE
-    # ═══════════════════════════════════════════════════════
-
+    # ── Reporte ──
     logger.info(f"\n{'═' * 60}")
     logger.info("📊 REPORTE DE LIMPIEZA")
     logger.info(f"{'═' * 60}")
     logger.info(f"\n{STATS.summary()}")
 
-    if examples_alias:
-        logger.info(f"\n🏷️ Ejemplos - Alias de marca:")
-        for ex in examples_alias:
+    if examples_garbage:
+        logger.info(f"\n🗑️ Ejemplos - Año basura:")
+        for ex in examples_garbage[:5]:
+            logger.info(
+                f"   [{ex['id']}] año {ex.get('año')}: "
+                f"{ex['reason']}"
+            )
+
+    if examples_b:
+        logger.info(f"\n🅱️ Ejemplos - Código → catálogo:")
+        for ex in examples_b[:5]:
             logger.info(
                 f"   [{ex['id']}] {ex['old']} → {ex['new']}"
             )
 
-    if examples_b:
-        logger.info(f"\n🅱️ Ejemplos - Código → nombre de catálogo:")
-        for ex in examples_b:
-            logger.info(
-                f"   [{ex['id']}] {ex['old']} → {ex['new']} "
-                f"({ex['razon']})"
-            )
-
     if examples_a:
         logger.info(f"\n🅰️ Ejemplos - Corrección por año:")
-        for ex in examples_a:
+        for ex in examples_a[:5]:
             logger.info(
                 f"   [{ex['id']}] año {ex.get('año')}: "
                 f"{ex['old']} → {ex['new']}"
             )
-            logger.info(f"      ↳ {ex['razon']}")
+            logger.info(f"      ↳ {ex['reason']}")
 
-    # ── Estado final de la BD ──
+    # Estado final
     if not dry_run:
-        logger.info(f"\n{'─' * 60}")
-        logger.info("📋 ESTADO FINAL DE LA BD")
-        logger.info(f"{'─' * 60}")
-
         conn.row_factory = sqlite3.Row
-
         total = conn.execute(
             "SELECT COUNT(*) as c FROM vehicles"
         ).fetchone()['c']
-        activos = conn.execute(
-            "SELECT COUNT(*) as c FROM vehicles WHERE activo = 1"
-        ).fetchone()['c']
+        logger.info(f"\n📋 BD final: {total} vehículos")
 
-        logger.info(f"   Total: {total} | Activos: {activos}")
-
-        # Distribución norm_status
         rows = conn.execute("""
             SELECT norm_status, COUNT(*) as c
-            FROM vehicles
-            GROUP BY norm_status
+            FROM vehicles GROUP BY norm_status
             ORDER BY c DESC
         """).fetchall()
-        logger.info(f"\n   Distribución norm_status:")
         for row in rows:
-            logger.info(f"      {row['norm_status'] or 'NULL'}: {row['c']}")
+            logger.info(
+                f"   {row['norm_status'] or 'NULL'}: {row['c']}"
+            )
 
-        # Changelog
-        cl_count = conn.execute(
+        cl = conn.execute(
             f"SELECT COUNT(*) as c FROM {CHANGELOG_TABLE}"
         ).fetchone()['c']
-        logger.info(f"\n   Entradas en changelog: {cl_count}")
-
-        if cl_count > 0:
-            rows = conn.execute(f"""
-                SELECT estrategia, COUNT(*) as c
-                FROM {CHANGELOG_TABLE}
-                GROUP BY estrategia
-                ORDER BY c DESC
-            """).fetchall()
-            for row in rows:
-                logger.info(
-                    f"      {row['estrategia']}: {row['c']}"
-                )
+        logger.info(f"\n📝 Changelog: {cl} entradas")
 
     conn.close()
 
     if dry_run:
-        logger.info(f"\n⚡ DRY-RUN: {STATS.total_fixes} cambios "
-                     f"identificados, ninguno aplicado")
+        logger.info(
+            f"\n⚡ DRY-RUN: {STATS.total_fixes} cambios "
+            f"identificados, ninguno aplicado"
+        )
 
     logger.info(f"\n{'═' * 60}")
-    logger.info("✅ PROCESO COMPLETADO")
+    logger.info("✅ COMPLETADO")
     logger.info(f"{'═' * 60}")
-
     return STATS
 
 
-# ═══════════════════════════════════════════════════════════════
-# 🚀 MAIN
-# ═══════════════════════════════════════════════════════════════
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='🧹 Limpieza de BD - Estrategias A y B'
+        description='🧹 Limpieza de BD v1.1 — Estrategias A + B'
     )
     parser.add_argument(
         '--db', default=DEFAULT_DB,
@@ -763,11 +777,11 @@ def parse_args():
     )
     parser.add_argument(
         '--dry-run', action='store_true',
-        help='Simular cambios sin aplicarlos'
+        help='Simular sin aplicar'
     )
     parser.add_argument(
         '--dicts-path', default='config/normalizer_dicts.json',
-        help='Ruta al JSON de diccionarios del normalizer v2'
+        help='Ruta al JSON de diccionarios'
     )
     parser.add_argument(
         '-v', '--verbose', action='store_true',
@@ -778,16 +792,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.verbose:
-        setup_logging(verbose=True)
-
+    setup_logging(args.verbose)
     stats = run_cleaner(
         db_path=args.db,
         dry_run=args.dry_run,
         dicts_path=args.dicts_path,
     )
-
-    # Exit code basado en errores
     if stats.errors > stats.total_vehicles * 0.1:
         sys.exit(1)
     sys.exit(0)
