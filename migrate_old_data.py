@@ -1,20 +1,21 @@
 """
-🔄 migrate_old_data.py v1.0 - Migración retroactiva de datos existentes
+🔄 migrate_old_data.py v1.1 - Migración retroactiva de datos existentes
 =========================================================================
 Aplica las mejoras v2.6 a los registros viejos de la BD:
 
-  PASO 1: Agregar columnas nuevas al schema (si no existen)
+  PASO 1: Agregar columnas nuevas al schema (SIEMPRE, incluso en dry-run)
   PASO 2: Poblar version_raw desde version existente
   PASO 3: Extraer metadata (puertas, tracción, GNC, 0km) de textos
   PASO 4: Re-normalizar registros parciales/fallback con normalizer v5.0
   PASO 5: Estadísticas finales y comparación
 
+NOTA: dry-run solo afecta modificaciones de DATOS (pasos 2-4).
+      Las columnas (paso 1) se agregan siempre porque son necesarias
+      para que los pasos siguientes puedan consultar la BD.
+
 EJECUCIÓN DESDE GITHUB ACTIONS:
   python migrate_old_data.py
   python migrate_old_data.py --dry-run
-  python migrate_old_data.py --db rosariogarage.db --verbose
-
-EJECUCIÓN LOCAL:
   python migrate_old_data.py --db rosariogarage.db --verbose
 """
 
@@ -187,7 +188,6 @@ def get_existing_columns(conn) -> set:
 
 def get_norm_status_counts(conn) -> Dict[str, int]:
     """Obtiene conteo por norm_status."""
-    conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT COALESCE(norm_status, 'NULL') as status,
                COUNT(*) as c
@@ -195,7 +195,7 @@ def get_norm_status_counts(conn) -> Dict[str, int]:
         GROUP BY norm_status
         ORDER BY c DESC
     """).fetchall()
-    return {r['status']: r['c'] for r in rows}
+    return {r[0]: r[1] for r in rows}
 
 
 def get_full_stats(conn) -> Dict[str, Any]:
@@ -230,26 +230,28 @@ def get_full_stats(conn) -> Dict[str, Any]:
 
     stats['norm_status'] = get_norm_status_counts(conn)
 
-    # Metadata (puede no existir aún)
+    # Metadata — consultar solo columnas que existen
     existing = get_existing_columns(conn)
+
     for col in ['puertas', 'traccion', 'tiene_gnc',
                 'es_0km', 'version_raw', 'descripcion']:
-        if col in existing:
-            try:
-                if col in ('tiene_gnc', 'es_0km'):
-                    stats[f'con_{col}'] = conn.execute(
-                        f"SELECT COUNT(*) FROM vehicles "
-                        f"WHERE {col} = 1"
-                    ).fetchone()[0]
-                else:
-                    stats[f'con_{col}'] = conn.execute(
-                        f"SELECT COUNT(*) FROM vehicles "
-                        f"WHERE {col} IS NOT NULL"
-                    ).fetchone()[0]
-            except Exception:
-                stats[f'con_{col}'] = 0
-        else:
-            stats[f'con_{col}'] = 0
+        key = f'con_{col}'
+        if col not in existing:
+            stats[key] = 0
+            continue
+        try:
+            if col in ('tiene_gnc', 'es_0km'):
+                stats[key] = conn.execute(
+                    f"SELECT COUNT(*) FROM vehicles "
+                    f"WHERE {col} = 1"
+                ).fetchone()[0]
+            else:
+                stats[key] = conn.execute(
+                    f"SELECT COUNT(*) FROM vehicles "
+                    f"WHERE {col} IS NOT NULL"
+                ).fetchone()[0]
+        except Exception:
+            stats[key] = 0
 
     return stats
 
@@ -260,7 +262,10 @@ def print_comparison(antes: Dict, despues: Dict):
     print("📊 COMPARACIÓN ANTES vs DESPUÉS")
     print(f"{'═' * 65}")
 
-    print(f"\n{'Métrica':<30} {'Antes':>10} {'Después':>10} {'Δ':>10}")
+    print(
+        f"\n{'Métrica':<30} {'Antes':>10} "
+        f"{'Después':>10} {'Δ':>10}"
+    )
     print("─" * 65)
 
     for key, label in [
@@ -308,10 +313,16 @@ def print_comparison(antes: Dict, despues: Dict):
 
 # ═══════════════════════════════════════════════════════════════
 # 📋 PASO 1: AGREGAR COLUMNAS NUEVAS
+#    ⚠️ Se ejecuta SIEMPRE (incluso en dry-run) porque los
+#    pasos siguientes necesitan que las columnas existan
+#    para poder hacer SELECT sobre ellas.
 # ═══════════════════════════════════════════════════════════════
 
-def step1_add_columns(conn, dry_run=False):
-    logger.info("\n📋 PASO 1: Verificar/agregar columnas nuevas")
+def step1_add_columns(conn):
+    logger.info(
+        "\n📋 PASO 1: Verificar/agregar columnas nuevas "
+        "(siempre se ejecuta)"
+    )
     logger.info("─" * 50)
 
     existing = get_existing_columns(conn)
@@ -321,21 +332,17 @@ def step1_add_columns(conn, dry_run=False):
             logger.info(f"   ✓ {col} ya existe")
             STATS.columns_existed += 1
         else:
-            if not dry_run:
-                try:
-                    conn.execute(
-                        f"ALTER TABLE vehicles "
-                        f"ADD COLUMN {col} {col_type}"
-                    )
-                    logger.info(f"   + {col} ({col_type})")
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"   ⚠️ {col}: {e}")
-            else:
-                logger.info(f"   [DRY] + {col} ({col_type})")
-            STATS.columns_added += 1
+            try:
+                conn.execute(
+                    f"ALTER TABLE vehicles "
+                    f"ADD COLUMN {col} {col_type}"
+                )
+                logger.info(f"   + {col} ({col_type})")
+                STATS.columns_added += 1
+            except sqlite3.OperationalError as e:
+                logger.warning(f"   ⚠️ {col}: {e}")
 
-    if not dry_run:
-        conn.commit()
+    conn.commit()
 
     logger.info(
         f"   Resultado: {STATS.columns_added} agregadas, "
@@ -381,6 +388,7 @@ def step2_populate_version_raw(conn, dry_run=False):
               AND version != ''
         """)
         STATS.version_raw_populated = result.rowcount
+        STATS.total_changes += result.rowcount
         conn.commit()
         logger.info(
             f"   ✅ Poblados: {STATS.version_raw_populated}"
@@ -395,15 +403,16 @@ def step2_populate_version_raw(conn, dry_run=False):
 # ═══════════════════════════════════════════════════════════════
 
 def step3_extract_metadata(conn, dry_run=False):
-    logger.info("\n📋 PASO 3: Extraer metadata de textos existentes")
+    logger.info(
+        "\n📋 PASO 3: Extraer metadata de textos existentes"
+    )
     logger.info("─" * 50)
 
-    conn.row_factory = sqlite3.Row
-
-    # Buscar registros que tengan texto pero no metadata
+    # Buscar registros que tengan texto pero no metadata completa
     rows = conn.execute("""
-        SELECT id, version, version_raw, descripcion, kilometros,
-               puertas, traccion, tiene_gnc, es_0km
+        SELECT id, version, version_raw, descripcion,
+               kilometros, puertas, traccion,
+               tiene_gnc, es_0km
         FROM vehicles
         WHERE (version IS NOT NULL OR version_raw IS NOT NULL
                OR descripcion IS NOT NULL)
@@ -416,13 +425,20 @@ def step3_extract_metadata(conn, dry_run=False):
     batch_count = 0
 
     for row in rows:
-        row = dict(row)
+        # row es una tupla por defecto
+        vid = row[0]
+        version_val = row[1] or ''
+        version_raw_val = row[2] or ''
+        descripcion_val = row[3] or ''
+        km = row[4] or 0
+        existing_puertas = row[5]
+        existing_traccion = row[6]
+        existing_gnc = row[7] or 0
+        existing_0km = row[8] or 0
 
         # Combinar todos los textos disponibles
         text = ' '.join(filter(None, [
-            row.get('version_raw', ''),
-            row.get('version', ''),
-            row.get('descripcion', ''),
+            version_raw_val, version_val, descripcion_val
         ]))
 
         if not text.strip():
@@ -431,14 +447,14 @@ def step3_extract_metadata(conn, dry_run=False):
         updates = {}
 
         # Puertas (solo si no tiene)
-        if not row.get('puertas'):
+        if not existing_puertas:
             m = RE_PUERTAS.search(text)
             if m:
                 updates['puertas'] = int(m.group(1))
                 STATS.puertas_extracted += 1
 
         # Tracción (solo si no tiene)
-        if not row.get('traccion'):
+        if not existing_traccion:
             m = RE_TRACCION.search(text)
             if m:
                 updates['traccion'] = (
@@ -447,14 +463,13 @@ def step3_extract_metadata(conn, dry_run=False):
                 STATS.traccion_extracted += 1
 
         # GNC (solo si no tiene)
-        if not row.get('tiene_gnc'):
+        if not existing_gnc:
             if RE_GNC.search(text):
                 updates['tiene_gnc'] = 1
                 STATS.gnc_detected += 1
 
         # 0km (solo si no tiene y km==0)
-        if not row.get('es_0km'):
-            km = row.get('kilometros', 0) or 0
+        if not existing_0km:
             if km == 0 and RE_0KM.search(text):
                 updates['es_0km'] = 1
                 STATS.es_0km_detected += 1
@@ -462,7 +477,7 @@ def step3_extract_metadata(conn, dry_run=False):
         if updates:
             if not dry_run:
                 sets = ', '.join(f"{k} = ?" for k in updates)
-                vals = list(updates.values()) + [row['id']]
+                vals = list(updates.values()) + [vid]
                 conn.execute(
                     f"UPDATE vehicles SET {sets} WHERE id = ?",
                     vals
@@ -481,7 +496,8 @@ def step3_extract_metadata(conn, dry_run=False):
     STATS.metadata_updated = updated
     STATS.total_changes += updated
 
-    logger.info(f"   ✅ Registros actualizados: {updated}")
+    prefix = "[DRY] " if dry_run else "✅ "
+    logger.info(f"   {prefix}Registros actualizados: {updated}")
     logger.info(f"      Puertas: {STATS.puertas_extracted}")
     logger.info(f"      Tracción: {STATS.traccion_extracted}")
     logger.info(f"      GNC: {STATS.gnc_detected}")
@@ -492,16 +508,20 @@ def step3_extract_metadata(conn, dry_run=False):
 # 📋 PASO 4: RE-NORMALIZAR REGISTROS
 # ═══════════════════════════════════════════════════════════════
 
-def step4_renormalize(conn, dry_run=False):
-    logger.info("\n📋 PASO 4: Re-normalizar registros parciales")
+def step4_renormalize(conn, dry_run=False, dicts_path=None):
+    logger.info(
+        "\n📋 PASO 4: Re-normalizar registros parciales"
+    )
     logger.info("─" * 50)
 
     if not HAS_NV2:
-        logger.warning("   ⚠️ normalizer_v2 no disponible, saltando")
+        logger.warning(
+            "   ⚠️ normalizer_v2 no disponible, saltando"
+        )
         return
 
     # Inicializar normalizer
-    dicts = DICTS_PATH
+    dicts = dicts_path or DICTS_PATH
     aliases = BRAND_ALIASES_PATH
 
     if not os.path.exists(dicts):
@@ -510,7 +530,9 @@ def step4_renormalize(conn, dry_run=False):
 
     loaded = nv2.init_normalizer(
         dicts_path=dicts,
-        brand_aliases_path=aliases if os.path.exists(aliases) else None
+        brand_aliases_path=(
+            aliases if os.path.exists(aliases) else None
+        )
     )
     if not loaded:
         logger.warning("   ⚠️ Catálogo no cargado, saltando")
@@ -519,7 +541,6 @@ def step4_renormalize(conn, dry_run=False):
     logger.info("   ✅ Normalizer inicializado")
 
     # Obtener candidatos
-    conn.row_factory = sqlite3.Row
     placeholders = ','.join('?' * len(RENORM_STATUSES))
     rows = conn.execute(f"""
         SELECT id, marca, modelo, version, version_raw,
@@ -551,7 +572,7 @@ def step4_renormalize(conn, dry_run=False):
     # Breakdown por status
     status_counts = {}
     for r in rows:
-        s = r['norm_status'] or 'NULL'
+        s = r[11] or 'NULL'  # norm_status es columna 11
         status_counts[s] = status_counts.get(s, 0) + 1
     for s, c in sorted(
         status_counts.items(), key=lambda x: -x[1]
@@ -564,26 +585,34 @@ def step4_renormalize(conn, dry_run=False):
     batch_count = 0
 
     for i, row in enumerate(rows):
-        row = dict(row)
-        vid = row['id']
+        # Desempaquetar tupla por índice
+        vid = row[0]
+        marca = row[1] or ''
+        modelo = row[2] or ''
+        version = row[3] or ''
+        version_raw_val = row[4] or ''
+        descripcion = row[5] or ''
+        año = row[6]
+        kilometros = row[7]
+        precio_usd = row[8]
+        old_status = row[11] or 'pending'
+        old_confidence = row[12] or 0
+        existing_puertas = row[13]
+        existing_traccion = row[14]
+        existing_gnc = row[15] or 0
+        existing_0km = row[16] or 0
 
         try:
             # Preparar input para normalizer
-            version_input = (
-                row.get('version_raw')
-                or row.get('version')
-                or ''
-            )
-            descripcion = row.get('descripcion') or ''
-            marca = row.get('marca', '')
-            modelo = row.get('modelo', '')
+            version_input = version_raw_val or version
 
             # Pre-limpiar: quitar marca de version
             version_for_norm = version_input
             if marca and version_for_norm:
                 version_for_norm = re.sub(
                     r'\b' + re.escape(marca) + r'\b',
-                    '', version_for_norm, flags=re.IGNORECASE
+                    '', version_for_norm,
+                    flags=re.IGNORECASE
                 ).strip()
 
             norm = nv2.normalize_vehicle(
@@ -592,13 +621,12 @@ def step4_renormalize(conn, dry_run=False):
                 marca_raw=marca,
                 modelo_raw=modelo,
                 version_raw=version_for_norm,
-                año_raw=row.get('año'),
-                km_raw=row.get('kilometros'),
-                precio_raw=row.get('precio_usd'),
+                año_raw=año,
+                km_raw=kilometros,
+                precio_raw=precio_usd,
             )
 
             updates = {}
-            old_status = row.get('norm_status', 'pending')
             new_status = norm.get('norm_status', 'fallback')
             new_confidence = norm.get('confidence', 0)
 
@@ -617,7 +645,7 @@ def step4_renormalize(conn, dry_run=False):
 
             # ── Actualizar versión si encontró ──
             new_version = norm.get('version')
-            if new_version and not row.get('version'):
+            if new_version and not version:
                 updates['version'] = new_version
                 STATS.renorm_version_found += 1
                 if len(examples_version) < 15:
@@ -658,22 +686,22 @@ def step4_renormalize(conn, dry_run=False):
             meta_added = False
 
             if (extracted.get('puertas')
-                    and not row.get('puertas')):
+                    and not existing_puertas):
                 updates['puertas'] = extracted['puertas']
                 meta_added = True
 
             if (extracted.get('traccion')
-                    and not row.get('traccion')):
+                    and not existing_traccion):
                 updates['traccion'] = extracted['traccion']
                 meta_added = True
 
             if (extracted.get('tiene_gnc')
-                    and not row.get('tiene_gnc')):
+                    and not existing_gnc):
                 updates['tiene_gnc'] = 1
                 meta_added = True
 
             if (extracted.get('es_0km')
-                    and not row.get('es_0km')):
+                    and not existing_0km):
                 updates['es_0km'] = 1
                 meta_added = True
 
@@ -694,10 +722,14 @@ def step4_renormalize(conn, dry_run=False):
                 if batch_count >= 500:
                     conn.commit()
                     batch_count = 0
+            elif updates and dry_run:
+                STATS.total_changes += 1
 
         except Exception as e:
             STATS.renorm_errors += 1
-            logger.debug(f"   Error re-normalizando {vid}: {e}")
+            logger.debug(
+                f"   Error re-normalizando {vid}: {e}"
+            )
 
         # Progress log
         if (i + 1) % 500 == 0 or (i + 1) == len(rows):
@@ -712,8 +744,12 @@ def step4_renormalize(conn, dry_run=False):
         conn.commit()
 
     # Ejemplos
+    prefix = "[DRY] " if dry_run else ""
+
     if examples_version:
-        logger.info(f"\n   📋 Ejemplos - Versiones encontradas:")
+        logger.info(
+            f"\n   📋 {prefix}Ejemplos - Versiones encontradas:"
+        )
         for ex in examples_version[:10]:
             logger.info(
                 f"      [{ex['id']}] {ex['marca']} "
@@ -723,7 +759,9 @@ def step4_renormalize(conn, dry_run=False):
             )
 
     if examples_model:
-        logger.info(f"\n   📋 Ejemplos - Modelos mejorados:")
+        logger.info(
+            f"\n   📋 {prefix}Ejemplos - Modelos mejorados:"
+        )
         for ex in examples_model[:5]:
             logger.info(
                 f"      [{ex['id']}] '{ex['old']}' → "
@@ -731,14 +769,18 @@ def step4_renormalize(conn, dry_run=False):
             )
 
     if examples_status:
-        logger.info(f"\n   📋 Ejemplos - Status upgrades:")
+        logger.info(
+            f"\n   📋 {prefix}Ejemplos - Status upgrades:"
+        )
         for ex in examples_status[:5]:
             logger.info(
-                f"      [{ex['id']}] {ex['old']} → {ex['new']}"
+                f"      [{ex['id']}] {ex['old']} → "
+                f"{ex['new']}"
             )
 
     logger.info(
-        f"\n   ✅ Re-normalización completada: "
+        f"\n   {'✅' if not dry_run else '⚡ [DRY]'} "
+        f"Re-normalización completada: "
         f"{STATS.renorm_version_found} versiones, "
         f"{STATS.renorm_model_improved} modelos, "
         f"{STATS.renorm_status_upgraded} status upgrades"
@@ -749,16 +791,20 @@ def step4_renormalize(conn, dry_run=False):
 # 🚀 MAIN
 # ═══════════════════════════════════════════════════════════════
 
-def run_migration(db_path, dry_run=False):
+def run_migration(db_path, dry_run=False, dicts_path=None):
     global STATS
     STATS = MigrationStats()
 
     logger.info("=" * 60)
-    logger.info("🔄 MIGRACIÓN RETROACTIVA DE DATOS v1.0")
+    logger.info("🔄 MIGRACIÓN RETROACTIVA DE DATOS v1.1")
     logger.info("=" * 60)
 
     if dry_run:
-        logger.info("⚡ MODO DRY-RUN: no se aplicarán cambios")
+        logger.info(
+            "⚡ MODO DRY-RUN: solo las columnas se agregan "
+            "(necesarias para consultas), los datos NO se "
+            "modifican"
+        )
 
     if not os.path.exists(db_path):
         logger.error(f"❌ BD no encontrada: {db_path}")
@@ -774,7 +820,9 @@ def run_migration(db_path, dry_run=False):
         shutil.copy2(db_path, backup)
         logger.info(f"💾 Backup: {backup}")
     else:
-        logger.info(f"💾 [DRY] Backup se haría en: {backup}")
+        logger.info(
+            f"💾 [DRY] Backup se haría en: {backup}"
+        )
 
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -788,16 +836,20 @@ def run_migration(db_path, dry_run=False):
     logger.info(f"   Activos: {stats_antes['activos']}")
     logger.info(f"   Con marca: {stats_antes['con_marca']}")
     logger.info(f"   Con modelo: {stats_antes['con_modelo']}")
-    logger.info(f"   Con versión: {stats_antes['con_version']}")
+    logger.info(
+        f"   Con versión: {stats_antes['con_version']}"
+    )
     logger.info("   norm_status:")
     for s, c in stats_antes['norm_status'].items():
         logger.info(f"      {s}: {c}")
 
-    # ── EJECUTAR PASOS ──
-    step1_add_columns(conn, dry_run)
+    # ── PASO 1: SIEMPRE se ejecuta (schema) ──
+    step1_add_columns(conn)
+
+    # ── PASOS 2-4: respetan dry-run ──
     step2_populate_version_raw(conn, dry_run)
     step3_extract_metadata(conn, dry_run)
-    step4_renormalize(conn, dry_run)
+    step4_renormalize(conn, dry_run, dicts_path)
 
     # Estadísticas DESPUÉS
     if not dry_run:
@@ -810,15 +862,20 @@ def run_migration(db_path, dry_run=False):
 
     # Guardar resumen para GitHub Actions
     summary = {
-        'antes': {k: v for k, v in stats_antes.items()
-                  if k != 'norm_status'},
-        'despues': {k: v for k, v in stats_despues.items()
-                    if k != 'norm_status'},
+        'antes': {
+            k: v for k, v in stats_antes.items()
+            if k != 'norm_status'
+        },
+        'despues': {
+            k: v for k, v in stats_despues.items()
+            if k != 'norm_status'
+        },
         'antes_norm': stats_antes.get('norm_status', {}),
         'despues_norm': stats_despues.get('norm_status', {}),
         'migration_stats': {
             'columns_added': STATS.columns_added,
-            'version_raw_populated': STATS.version_raw_populated,
+            'version_raw_populated':
+                STATS.version_raw_populated,
             'metadata_updated': STATS.metadata_updated,
             'puertas': STATS.puertas_extracted,
             'traccion': STATS.traccion_extracted,
@@ -843,7 +900,8 @@ def run_migration(db_path, dry_run=False):
 
     if dry_run:
         logger.info(
-            "\n⚡ DRY-RUN: ningún cambio fue aplicado"
+            "\n⚡ DRY-RUN: solo columnas fueron agregadas, "
+            "datos NO modificados"
         )
 
     logger.info("\n✅ MIGRACIÓN COMPLETADA")
@@ -855,7 +913,8 @@ def run_migration(db_path, dry_run=False):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            '🔄 Migración retroactiva de datos existentes v1.0'
+            '🔄 Migración retroactiva de datos '
+            'existentes v1.1'
         )
     )
     parser.add_argument(
@@ -864,7 +923,10 @@ def parse_args():
     )
     parser.add_argument(
         '--dry-run', action='store_true',
-        help='Simular sin aplicar cambios'
+        help=(
+            'Simular sin modificar datos '
+            '(columnas sí se agregan)'
+        )
     )
     parser.add_argument(
         '--dicts-path', default=DICTS_PATH,
@@ -878,18 +940,21 @@ def parse_args():
 
 
 def main():
-    global DICTS_PATH
     args = parse_args()
     setup_logging(args.verbose)
-    DICTS_PATH = args.dicts_path
 
     stats = run_migration(
         db_path=args.db,
         dry_run=args.dry_run,
+        dicts_path=args.dicts_path,
     )
 
-    if stats.renorm_errors > max(stats.renorm_candidates * 0.2, 50):
-        logger.error("❌ Demasiados errores en re-normalización")
+    if stats.renorm_errors > max(
+        stats.renorm_candidates * 0.2, 50
+    ):
+        logger.error(
+            "❌ Demasiados errores en re-normalización"
+        )
         sys.exit(1)
 
     sys.exit(0)
