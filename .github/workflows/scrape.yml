@@ -2,8 +2,8 @@
 name: 🚗 RosarioGarage Scraper
 
 on:
-  schedule:
-    - cron: '0 6 * * *'
+  #schedule:
+    #- cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       debug:
