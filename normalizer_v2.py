@@ -243,6 +243,8 @@ URGENCY_KEYWORDS = {
     'precio final': -20, 'no negociable': -25, 'firme': -15,
 }
 
+
+
 # ═══════════════════════════════════════════════════════════════
 # 🛠️ FUNCIONES AUXILIARES
 # ═══════════════════════════════════════════════════════════════
@@ -809,6 +811,256 @@ CATALOG = EnrichedCatalog()
 # 🎯 NORMALIZADOR v4.1
 # ═══════════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════════
+# 🔧 FUNCIONES AUXILIARES PARA MATCH DE VERSIONES (v4.2)
+# ═══════════════════════════════════════════════════════════════
+
+# ── Trims conocidos por marca ──
+KNOWN_TRIMS = {
+    'chevrolet': [
+        'lt', 'ls', 'ltz', 'ltz+', 'premier', 'rs',
+        'midnight', 'high country', 'highcountry',
+        'joy', 'effect', 'spirit', 'activ',
+        'wt', 'z71', 'base',
+        'gl', 'gls', 'cd', 'gsi', 'dlx', 'custom',
+        'deluxe', 'conquest', 'avantage',
+        'black edition',
+    ],
+    'ford': [
+        's', 'se', 'sel', 'titanium', 'trend',
+        'xls', 'xlt', 'limited', 'wildtrak',
+        'freestyle', 'kinetic',
+    ],
+    'fiat': [
+        'attractive', 'drive', 'like', 'way',
+        'trekking', 'freedom', 'precision',
+        'ranch', 'sporting', 'hlx', 'elx',
+        'fire', 'pack', 'base',
+    ],
+    'volkswagen': [
+        'trendline', 'comfortline', 'highline',
+        'sportline', 'hero', 'extreme',
+    ],
+    'renault': [
+        'life', 'zen', 'intens', 'iconic',
+        'outsider', 'expression', 'authentique',
+        'privilege', 'luxe', 'pack', 'confort',
+    ],
+    'toyota': [
+        'xli', 'xei', 'sr', 'srv', 'srx',
+        'sx', 'dx', 'dl', 'limited',
+        'gr-sport', 'gr sport',
+    ],
+    'peugeot': [
+        'allure', 'feline', 'active', 'gt',
+        'gt line', 'roadtrip',
+    ],
+}
+
+# Trims genéricos que aplican a muchas marcas
+GENERIC_TRIMS = {
+    'base', 'full', 'pack',
+    '4x2', '4x4', 'awd', 'fwd',
+    'mt', 'at', 'cvt', 'dsg',
+    'mt5', 'mt6', 'at6', 'at8', 'at9',
+}
+
+# ── Patrones de motorización en versiones ──
+RE_MOTOR_IN_VERSION = re.compile(
+    r'(\d+\.\d+)\s*([lt]|turbo|tdi|tfsi|hdi|thp|mpi|ts|'
+    r'vti|jtd|cdti|dci|tsi|mjet|multijet|ecoboost)?',
+    re.IGNORECASE
+)
+
+# Mapeo de abreviaciones de motorización
+MOTOR_ALIASES = {
+    '1.4t': ['1.4 turbo', '1.4 t', '1.4turbo', '14t'],
+    '1.0t': ['1.0 turbo', '1.0 t', '1.0turbo', '10t'],
+    '1.2t': ['1.2 turbo', '1.2 t', '1.2turbo', '12t'],
+    '2.8 td': ['2.8 turbo diesel', '2.8td', '2.8 diesel'],
+}
+
+
+def _normalize_version_text(text: str) -> str:
+    """
+    Normaliza texto de versión para comparación flexible.
+    "1.4T LT AT" → "14t lt at"
+    "1.4 Turbo LT" → "14 turbo lt"
+    """
+    if not text:
+        return ""
+    t = normalize_text(text)
+    # Quitar puntos entre dígitos: 1.4 → 14
+    t = re.sub(r'(\d)\.(\d)', r'\1\2', t)
+    return t
+
+
+def _extract_version_components(version: str) -> Dict:
+    """
+    Descompone una versión en sus componentes.
+    "1.4t lt at" → {
+        'motor': '1.4', 'motor_suffix': 't',
+        'trim': 'lt', 'trans': 'at',
+        'all_words': ['1.4t', 'lt', 'at']
+    }
+    """
+    result = {
+        'motor': None,
+        'motor_suffix': None,
+        'trim': None,
+        'trans': None,
+        'drive': None,
+        'all_words': [],
+        'trim_words': [],
+    }
+
+    if not version:
+        return result
+
+    v = normalize_text(version)
+    words = v.split()
+    result['all_words'] = words
+
+    trans_words = {'mt', 'at', 'cvt', 'dsg', 'mt5', 'mt6',
+                   'at6', 'at8', 'at9'}
+    drive_words = {'4x2', '4x4', 'awd', 'fwd', '2wd'}
+
+    for word in words:
+        # Motor: 1.4t, 2.0, 2.8
+        motor_match = re.match(
+            r'^(\d+\.?\d*)\s*([a-z]*)$', word
+        )
+        if motor_match and '.' in word or len(word) <= 4:
+            num = motor_match.group(1)
+            suffix = motor_match.group(2)
+            if '.' in num or (
+                len(num) <= 2 and suffix
+            ):
+                result['motor'] = num
+                result['motor_suffix'] = suffix or None
+                continue
+
+        # Transmisión
+        if word in trans_words:
+            result['trans'] = word
+            continue
+
+        # Tracción
+        if word in drive_words:
+            result['drive'] = word
+            continue
+
+        # El resto es trim
+        result['trim_words'].append(word)
+
+    if result['trim_words']:
+        result['trim'] = ' '.join(result['trim_words'])
+
+    return result
+
+
+def _score_version_match(
+    catalog_version: str,
+    search_text: str,
+) -> int:
+    """
+    Puntúa qué tan bien matchea una versión del catálogo
+    contra el texto de búsqueda.
+    
+    Retorna 0-100.
+    """
+    components = _extract_version_components(catalog_version)
+    search_norm = normalize_text(search_text)
+    score = 0
+    max_score = 0
+
+    # ── Trim (lo más importante: 50 pts) ──
+    if components['trim']:
+        max_score += 50
+        trim = components['trim']
+        if find_exact_in_text(trim, search_norm):
+            score += 50
+        else:
+            # Intentar palabras individuales del trim
+            trim_words = trim.split()
+            if trim_words:
+                found = sum(
+                    1 for w in trim_words
+                    if find_exact_in_text(w, search_norm)
+                )
+                score += int(50 * found / len(trim_words))
+
+    # ── Motor (20 pts) ──
+    if components['motor']:
+        max_score += 20
+        motor = components['motor']
+        motor_with_suffix = (
+            f"{motor}{components['motor_suffix']}"
+            if components['motor_suffix'] else motor
+        )
+
+        if find_exact_in_text(motor_with_suffix, search_norm):
+            score += 20
+        elif find_exact_in_text(motor, search_norm):
+            score += 15
+        else:
+            # Buscar variantes: "1.4t" vs "1.4 turbo"
+            motor_compact = motor.replace('.', '')
+            if motor_compact in search_norm.replace('.', ''):
+                score += 10
+
+    # ── Transmisión (15 pts) ──
+    if components['trans']:
+        max_score += 15
+        if find_exact_in_text(
+            components['trans'], search_norm
+        ):
+            score += 15
+
+    # ── Tracción (15 pts) ──
+    if components['drive']:
+        max_score += 15
+        if find_exact_in_text(
+            components['drive'], search_norm
+        ):
+            score += 15
+
+    # Normalizar a 0-100
+    if max_score == 0:
+        return 0
+
+    return int(score * 100 / max_score)
+
+
+def _match_trim_only(
+    versiones: List[str],
+    search_text: str,
+) -> Optional[str]:
+    """
+    Busca solo el trim (sin motorización ni transmisión)
+    en el texto.
+    Si hay un único trim que matchea → lo retorna.
+    Si hay varios → retorna el más largo (más específico).
+    """
+    matches = []
+
+    for version in versiones:
+        components = _extract_version_components(version)
+        trim = components.get('trim')
+        if not trim or len(trim) < 2:
+            continue
+
+        if find_exact_in_text(trim, search_text):
+            matches.append((version, len(trim)))
+
+    if not matches:
+        return None
+
+    # Retornar el match con trim más largo (más específico)
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return matches[0][0]
+
 class VehicleNormalizerV4:
     """
     Pipeline de normalización:
@@ -1338,40 +1590,87 @@ class VehicleNormalizerV4:
     # VERSIÓN
     # ───────────────────────────────────────────────
 
-    def _find_version(self, marca, modelo,
-                      search_text) -> Optional[Dict]:
-        versiones = self.catalog.get_versions(marca, modelo)
-        if not versiones:
-            return None
+    # ─────────────────────────────────────────────────
+# VERSIÓN (MEJORADO v4.2 - match flexible)
+# ─────────────────────────────────────────────────
+def _find_version(self, marca, modelo, search_text) -> Optional[Dict]:
+    versiones = self.catalog.get_versions(marca, modelo)
+    if not versiones:
+        return None
 
-        versiones_sorted = sorted(versiones, key=len, reverse=True)
+    search_norm = normalize_text(search_text)
+    versiones_sorted = sorted(versiones, key=len, reverse=True)
 
-        for version in versiones_sorted:
-            if find_exact_in_text(version, search_text):
+    # ── 1. Match exacto completo (ideal) ──
+    for version in versiones_sorted:
+        if find_exact_in_text(version, search_norm):
+            return {
+                'value': version,
+                'from_catalog': True,
+                'method': 'exact'
+            }
+
+    # ── 2. Match normalizado (quitar puntos, guiones) ──
+    for version in versiones_sorted:
+        ver_compact = _normalize_version_text(version)
+        search_compact = _normalize_version_text(search_norm)
+        if ver_compact and find_exact_in_text(
+            ver_compact, search_compact
+        ):
+            return {
+                'value': version,
+                'from_catalog': True,
+                'method': 'exact_normalized'
+            }
+
+    # ── 3. Match por componentes (trim + motorización) ──
+    best_match = None
+    best_score = 0
+
+    for version in versiones_sorted:
+        score = _score_version_match(version, search_norm)
+        if score > best_score:
+            best_score = score
+            best_match = version
+
+    if best_match and best_score >= 60:
+        return {
+            'value': best_match,
+            'from_catalog': True,
+            'method': 'component_match'
+        }
+
+    # ── 4. Match solo por trim (LT, LTZ, etc.) ──
+    trim_match = _match_trim_only(
+        versiones_sorted, search_norm
+    )
+    if trim_match:
+        return {
+            'value': trim_match,
+            'from_catalog': True,
+            'method': 'trim_match'
+        }
+
+    # ── 5. Fuzzy (solo no-numéricos, restrictivo) ──
+    if CONFIG.enable_fuzzy:
+        valid_words = [
+            w for w in search_norm.split()
+            if (len(w) >= 3
+                and w.lower() not in FUZZY_BLACKLIST)
+        ]
+        for word in valid_words:
+            match = fuzzy_match(
+                word, versiones,
+                CONFIG.fuzzy_threshold_version
+            )
+            if match:
                 return {
-                    'value': version,
+                    'value': match[0],
                     'from_catalog': True,
-                    'method': 'exact'
+                    'method': 'fuzzy'
                 }
 
-        if CONFIG.enable_fuzzy:
-            valid_words = [
-                w for w in search_text.split()
-                if (len(w) >= 3
-                    and w.lower() not in FUZZY_BLACKLIST)
-            ]
-            for word in valid_words:
-                match = fuzzy_match(
-                    word, versiones,
-                    CONFIG.fuzzy_threshold_version
-                )
-                if match:
-                    return {
-                        'value': match[0],
-                        'from_catalog': True,
-                        'method': 'fuzzy'
-                    }
-        return None
+    return None
 
     # ───────────────────────────────────────────────
     # POST-VALIDACIÓN (con tolerancia ±2 años)
