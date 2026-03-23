@@ -1205,14 +1205,39 @@ class VehicleNormalizerV4:
 
         return None
 
-    def _clean_version_input(self, version_raw, marca, modelo):
+      def _clean_version_input(self, version_raw, marca, modelo):
         """Limpia version_raw quitando marca y modelo."""
         text = normalize_text(version_raw) if version_raw else ""
         if marca:
-            text = re.sub(r'\b' + re.escape(normalize_key(marca)) + r'\b', '', text).strip()
-            text = re.sub(r'\b' + re.escape(normalize_key(marca).replace('-',' ')) + r'\b', '', text).strip()
+            marca_key = normalize_key(marca)
+            try:
+                text = re.sub(
+                    r'\b' + re.escape(marca_key) + r'\b',
+                    '', text
+                ).strip()
+            except re.error:
+                text = text.replace(marca_key, '').strip()
+            marca_nohyphen = marca_key.replace('-', ' ')
+            if marca_nohyphen != marca_key:
+                try:
+                    text = re.sub(
+                        r'\b' + re.escape(marca_nohyphen)
+                        + r'\b',
+                        '', text
+                    ).strip()
+                except re.error:
+                    text = text.replace(
+                        marca_nohyphen, ''
+                    ).strip()
         if modelo:
-            text = re.sub(r'\b' + re.escape(normalize_key(modelo)) + r'\b', '', text).strip()
+            modelo_key = normalize_key(modelo)
+            try:
+                text = re.sub(
+                    r'\b' + re.escape(modelo_key) + r'\b',
+                    '', text
+                ).strip()
+            except re.error:
+                text = text.replace(modelo_key, '').strip()
         return ' '.join(text.split())
 
     def _decompose_and_normalize(self, clean_input, search_text=""):
