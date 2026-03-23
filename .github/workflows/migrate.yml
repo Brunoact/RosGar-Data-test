@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       notify_dashboard:
-        description: 'Notificar al dashboard después de migrar'
+        description: 'Notificar al dashboard'
         required: false
         type: boolean
         default: true
@@ -24,9 +24,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ──────────────────────────────────────────────
-      # Setup
-      # ──────────────────────────────────────────────
       - name: 📥 Checkout código
         uses: actions/checkout@v4
 
@@ -41,250 +38,60 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ──────────────────────────────────────────────
-      # Descargar BD actual
-      # ──────────────────────────────────────────────
+      # ═══ FIX CRÍTICO: @v3 → @v6 ═══
       - name: 📥 Descargar BD maestra actual
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
         with:
           name: rosariogarage-master-db
           workflow: scrape.yml
           workflow_conclusion: success
+          if_no_artifact_found: warn
+          search_artifacts: true
+          allow_forks: false
 
-      - name: 📋 Verificar BD descargada
+      - name: 📋 Verificar BD
         run: |
           if [ ! -f "rosariogarage.db" ]; then
-            echo "❌ ERROR: No se encontró rosariogarage.db"
+            echo "❌ BD no encontrada. Ejecutá el scraper primero."
             exit 1
           fi
           echo "✅ BD encontrada"
           ls -lh rosariogarage.db
-          echo ""
-          echo "📊 Estado ANTES de migración:"
-          echo "─────────────────────────────────"
-          sqlite3 rosariogarage.db "SELECT COUNT(*) as 'Total vehículos:' FROM vehicles;"
-          sqlite3 rosariogarage.db "SELECT COUNT(*) as 'Activos:' FROM vehicles WHERE activo = 1;"
-          echo ""
-          echo "📋 Columnas actuales:"
-          sqlite3 rosariogarage.db "PRAGMA table_info(vehicles);" | while IFS='|' read num name type notnull dflt pk; do
-            echo "   $name ($type)"
-          done
-          echo ""
-          echo "📋 norm_status:"
-          sqlite3 rosariogarage.db "
-            SELECT COALESCE(norm_status, 'NULL') as status,
-                   COUNT(*) as cantidad
-            FROM vehicles
-            GROUP BY norm_status
-            ORDER BY cantidad DESC;
-          "
+          sqlite3 rosariogarage.db "SELECT COUNT(*) as 'Vehículos:' FROM vehicles;"
 
-      # ──────────────────────────────────────────────
-      # Verificar archivos
-      # ──────────────────────────────────────────────
-      - name: 📂 Verificar archivos necesarios
+      - name: 📂 Verificar archivos
         run: |
-          echo "Verificando archivos necesarios..."
-          MISSING=0
-
-          for f in "migrate_old_data.py" "normalizer_v2.py"; do
-            if [ -f "$f" ]; then
-              echo "✅ $f"
-            else
-              echo "❌ $f NO ENCONTRADO"
-              MISSING=$((MISSING + 1))
+          for f in "migrate_old_data.py" "normalizer_v2.py" "config/normalizer_dicts.json"; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Falta: $f"
+              exit 1
             fi
+            echo "✅ $f"
           done
 
-          if [ -f "config/normalizer_dicts.json" ]; then
-            echo "✅ config/normalizer_dicts.json"
-            python3 -c "
-          import json
-          with open('config/normalizer_dicts.json') as f:
-              d = json.load(f)
-          meta = d.get('_metadata', {})
-          print(f\"   Versión: {meta.get('generator_version', '?')}\")
-          print(f\"   Marcas: {meta.get('total_brands', '?')}\")
-          print(f\"   Modelos: {meta.get('total_models', '?')}\")
-          print(f\"   Versiones: {meta.get('total_versions', '?')}\")
-          print(f\"   Componentes: {meta.get('total_version_components', '?')}\")
-          "
-          else
-            echo "❌ config/normalizer_dicts.json NO ENCONTRADO"
-            MISSING=$((MISSING + 1))
-          fi
-
-          if [ "$MISSING" -gt 0 ]; then
-            echo ""
-            echo "❌ Faltan $MISSING archivos necesarios"
-            exit 1
-          fi
-
-      # ──────────────────────────────────────────────
-      # Backup
-      # ──────────────────────────────────────────────
-      - name: 💾 Crear backup pre-migración
+      - name: 💾 Backup pre-migración
         run: |
           cp rosariogarage.db rosariogarage_pre_migration.db
-          echo "✅ Backup: rosariogarage_pre_migration.db"
-          ls -lh rosariogarage_pre_migration.db
+          echo "✅ Backup creado"
 
-      # ──────────────────────────────────────────────
-      # Ejecutar migración
-      # ──────────────────────────────────────────────
       - name: 🔄 Ejecutar migración
         run: |
           ARGS="--db rosariogarage.db --verbose"
-
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "⚡ MODO DRY-RUN"
             ARGS="$ARGS --dry-run"
           fi
-
-          echo "Ejecutando: python migrate_old_data.py $ARGS"
           python migrate_old_data.py $ARGS
 
-      # ──────────────────────────────────────────────
-      # Verificar resultado
-      # ──────────────────────────────────────────────
-      - name: 📊 Verificar resultado de migración
+      - name: 📊 Verificar resultado
         if: inputs.dry_run != true
         run: |
-          echo "📊 Estado DESPUÉS de migración:"
-          echo "─────────────────────────────────"
-          sqlite3 rosariogarage.db "SELECT COUNT(*) as 'Total:' FROM vehicles;"
-          sqlite3 rosariogarage.db "SELECT COUNT(*) as 'Activos:' FROM vehicles WHERE activo = 1;"
-          echo ""
-
-          echo "📋 Columnas actuales:"
-          sqlite3 rosariogarage.db "PRAGMA table_info(vehicles);" | while IFS='|' read num name type notnull dflt pk; do
-            echo "   $name ($type)"
-          done
-          echo ""
-
-          echo "📋 norm_status:"
           sqlite3 rosariogarage.db "
-            SELECT COALESCE(norm_status, 'NULL') as status,
-                   COUNT(*) as cantidad
-            FROM vehicles
-            GROUP BY norm_status
-            ORDER BY cantidad DESC;
-          "
-          echo ""
-
-          echo "📋 Metadata poblada (activos):"
-          sqlite3 rosariogarage.db "
-            SELECT
-              SUM(CASE WHEN puertas IS NOT NULL THEN 1 ELSE 0 END) as con_puertas,
-              SUM(CASE WHEN traccion IS NOT NULL THEN 1 ELSE 0 END) as con_traccion,
-              SUM(CASE WHEN tiene_gnc = 1 THEN 1 ELSE 0 END) as con_gnc,
-              SUM(CASE WHEN es_0km = 1 THEN 1 ELSE 0 END) as con_0km,
-              SUM(CASE WHEN version_raw IS NOT NULL THEN 1 ELSE 0 END) as con_version_raw,
-              SUM(CASE WHEN descripcion IS NOT NULL THEN 1 ELSE 0 END) as con_descripcion
-            FROM vehicles WHERE activo = 1;
-          "
-          echo ""
-
-          echo "🏷️ Top 10 marcas:"
-          sqlite3 rosariogarage.db "
-            SELECT marca, COUNT(*) as c
-            FROM vehicles WHERE activo = 1 AND marca IS NOT NULL
-            GROUP BY marca ORDER BY c DESC LIMIT 10;
-          "
-          echo ""
-
-          echo "📋 Versiones encontradas (muestra):"
-          sqlite3 rosariogarage.db "
-            SELECT marca, modelo, version, norm_confidence
-            FROM vehicles
-            WHERE version IS NOT NULL AND version != ''
-              AND activo = 1
-            ORDER BY norm_confidence DESC
-            LIMIT 20;
+            SELECT COALESCE(norm_status, 'NULL') as status, COUNT(*) as cantidad
+            FROM vehicles GROUP BY norm_status ORDER BY cantidad DESC;
           "
 
-      # ──────────────────────────────────────────────
-      # Comparación detallada
-      # ──────────────────────────────────────────────
-      - name: 📊 Comparación antes vs después
-        if: inputs.dry_run != true
-        run: |
-          python3 << 'PYTHON_SCRIPT'
-          import sqlite3
-          import json
-
-          def get_stats(db_path):
-              conn = sqlite3.connect(db_path)
-              s = {}
-              s['total'] = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
-              s['activos'] = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
-              s['con_marca'] = conn.execute("SELECT COUNT(*) FROM vehicles WHERE marca IS NOT NULL AND marca != ''").fetchone()[0]
-              s['con_modelo'] = conn.execute("SELECT COUNT(*) FROM vehicles WHERE modelo IS NOT NULL AND modelo != ''").fetchone()[0]
-              try:
-                  s['con_version'] = conn.execute("SELECT COUNT(*) FROM vehicles WHERE version IS NOT NULL AND version != ''").fetchone()[0]
-              except:
-                  s['con_version'] = 0
-
-              rows = conn.execute("SELECT COALESCE(norm_status, 'NULL') as s, COUNT(*) as c FROM vehicles GROUP BY norm_status ORDER BY c DESC").fetchall()
-              s['norm'] = {r[0]: r[1] for r in rows}
-
-              try:
-                  meta = conn.execute("""
-                      SELECT
-                        SUM(CASE WHEN puertas IS NOT NULL THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN traccion IS NOT NULL THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN tiene_gnc = 1 THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN es_0km = 1 THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN version_raw IS NOT NULL THEN 1 ELSE 0 END)
-                      FROM vehicles
-                  """).fetchone()
-                  s['puertas'] = meta[0] or 0
-                  s['traccion'] = meta[1] or 0
-                  s['gnc'] = meta[2] or 0
-                  s['es_0km'] = meta[3] or 0
-                  s['version_raw'] = meta[4] or 0
-              except:
-                  s['puertas'] = s['traccion'] = s['gnc'] = s['es_0km'] = s['version_raw'] = 0
-
-              conn.close()
-              return s
-
-          a = get_stats('rosariogarage_pre_migration.db')
-          d = get_stats('rosariogarage.db')
-
-          print("=" * 65)
-          print("📊 COMPARACIÓN COMPLETA")
-          print("=" * 65)
-          print(f"\n{'Métrica':<25} {'Antes':>10} {'Después':>10} {'Δ':>10}")
-          print("─" * 60)
-
-          for key, label in [('total','Total'), ('activos','Activos'),
-                              ('con_marca','Con marca'), ('con_modelo','Con modelo'),
-                              ('con_version','Con versión'), ('puertas','Puertas'),
-                              ('traccion','Tracción'), ('gnc','GNC'),
-                              ('es_0km','0km'), ('version_raw','version_raw')]:
-              av = a.get(key, 0)
-              dv = d.get(key, 0)
-              delta = dv - av
-              sign = '+' if delta > 0 else ''
-              print(f"  {label:<23} {av:>10} {dv:>10} {sign}{delta:>9}")
-
-          print(f"\n  norm_status:")
-          all_s = set(list(a.get('norm',{}).keys()) + list(d.get('norm',{}).keys()))
-          for s in sorted(all_s):
-              av = a.get('norm',{}).get(s, 0)
-              dv = d.get('norm',{}).get(s, 0)
-              delta = dv - av
-              sign = '+' if delta > 0 else ''
-              print(f"  {s:<23} {av:>10} {dv:>10} {sign}{delta:>9}")
-
-          print("=" * 65)
-          PYTHON_SCRIPT
-
-      # ──────────────────────────────────────────────
-      # Subir artifacts
-      # ──────────────────────────────────────────────
-      - name: 📤 Subir BD migrada como master
+      - name: 📤 Subir BD migrada (master)
         if: inputs.dry_run != true
         uses: actions/upload-artifact@v4
         with:
@@ -292,10 +99,9 @@ jobs:
           path: rosariogarage.db
           retention-days: 90
           compression-level: 9
-          if-no-files-found: error
           overwrite: true
 
-      - name: 📦 Subir BD migrada para dashboard
+      - name: 📦 Subir BD para dashboard
         if: inputs.dry_run != true
         uses: actions/upload-artifact@v4
         with:
@@ -303,135 +109,21 @@ jobs:
           path: rosariogarage.db
           retention-days: 90
           compression-level: 9
-          if-no-files-found: error
           overwrite: true
 
-      - name: 📦 Subir BD pre-migración (backup)
+      - name: 📦 Subir backup
         uses: actions/upload-artifact@v4
         with:
           name: rosariogarage-pre-migration-db
           path: rosariogarage_pre_migration.db
           retention-days: 30
-          compression-level: 9
-
-      - name: 📦 Subir resumen JSON
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: migration-summary
-          path: migration_summary.json
-          retention-days: 30
-          if-no-files-found: warn
-
-      # ──────────────────────────────────────────────
-      # Notificar dashboard
-      # ──────────────────────────────────────────────
-      - name: 📅 Obtener fecha
-        if: inputs.dry_run != true && inputs.notify_dashboard == true
-        id: date
-        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
       - name: 🚀 Notificar dashboard
         if: inputs.dry_run != true && inputs.notify_dashboard == true
         uses: peter-evans/repository-dispatch@v3
+        continue-on-error: true
         with:
           token: ${{ secrets.DASHBOARD_REPO_PAT }}
           repository: Brunoact/Ros-Gar-Dash
           event-type: db-updated
-          client-payload: |
-            {
-              "run_id": "${{ github.run_id }}",
-              "scrape_date": "${{ steps.date.outputs.date }}",
-              "source": "migration"
-            }
-
-      # ──────────────────────────────────────────────
-      # Resumen del workflow
-      # ──────────────────────────────────────────────
-      - name: 📝 Crear resumen del workflow
-        if: always()
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # ⚡ Migración - DRY RUN
-
-          Se ejecutó en modo simulación. No se aplicaron cambios.
-          Ver logs del paso "🔄 Ejecutar migración" para detalles.
-          EOF
-          else
-            if [ -f migration_summary.json ]; then
-              COLS=$(jq -r '.migration_stats.columns_added // 0' migration_summary.json)
-              VRAW=$(jq -r '.migration_stats.version_raw_populated // 0' migration_summary.json)
-              META=$(jq -r '.migration_stats.metadata_updated // 0' migration_summary.json)
-              PUERTAS=$(jq -r '.migration_stats.puertas // 0' migration_summary.json)
-              TRACCION=$(jq -r '.migration_stats.traccion // 0' migration_summary.json)
-              GNC=$(jq -r '.migration_stats.gnc // 0' migration_summary.json)
-              ZKM=$(jq -r '.migration_stats.es_0km // 0' migration_summary.json)
-              VERSIONS=$(jq -r '.migration_stats.versions_found // 0' migration_summary.json)
-              MODELS=$(jq -r '.migration_stats.models_improved // 0' migration_summary.json)
-              UPGRADED=$(jq -r '.migration_stats.status_upgraded // 0' migration_summary.json)
-              ERRORS=$(jq -r '.migration_stats.errors // 0' migration_summary.json)
-              TOTAL=$(jq -r '.migration_stats.total_changes // 0' migration_summary.json)
-
-              ANTES_FULL=$(jq -r '.antes_norm.full_match // 0' migration_summary.json)
-              DESPUES_FULL=$(jq -r '.despues_norm.full_match // 0' migration_summary.json)
-              ANTES_PARTIAL=$(jq -r '.antes_norm.partial_match // 0' migration_summary.json)
-              DESPUES_PARTIAL=$(jq -r '.despues_norm.partial_match // 0' migration_summary.json)
-            else
-              COLS="?"; VRAW="?"; META="?"; PUERTAS="?"; TRACCION="?"
-              GNC="?"; ZKM="?"; VERSIONS="?"; MODELS="?"; UPGRADED="?"
-              ERRORS="?"; TOTAL="?"; ANTES_FULL="?"; DESPUES_FULL="?"
-              ANTES_PARTIAL="?"; DESPUES_PARTIAL="?"
-            fi
-
-            cat >> $GITHUB_STEP_SUMMARY << EOF
-          # 🔄 Migración Completada
-
-          **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
-
-          ## 📊 Resumen de cambios
-
-          | Métrica | Valor |
-          |---------|-------|
-          | 📝 Total cambios | **${TOTAL}** |
-          | 📋 Columnas agregadas | **${COLS}** |
-          | 📄 version_raw poblados | **${VRAW}** |
-          | ❌ Errores | **${ERRORS}** |
-
-          ## 📋 Metadata extraída
-
-          | Campo | Cantidad |
-          |-------|----------|
-          | 🚪 Puertas | **${PUERTAS}** |
-          | 🛞 Tracción | **${TRACCION}** |
-          | ⛽ GNC | **${GNC}** |
-          | 🆕 0km | **${ZKM}** |
-
-          ## 🔧 Re-normalización
-
-          | Métrica | Valor |
-          |---------|-------|
-          | 🔍 Versiones encontradas | **${VERSIONS}** |
-          | 🏷️ Modelos mejorados | **${MODELS}** |
-          | ⬆️ Status upgrades | **${UPGRADED}** |
-
-          ## 📊 Normalización antes/después
-
-          | Estado | Antes | Después |
-          |--------|-------|---------|
-          | ✅ full_match | ${ANTES_FULL} | **${DESPUES_FULL}** |
-          | 🟡 partial_match | ${ANTES_PARTIAL} | **${DESPUES_PARTIAL}** |
-
-          ## 📥 Artifacts
-
-          | Artifact | Descripción | Retención |
-          |----------|-------------|-----------|
-          | \`rosariogarage-master-db\` | BD migrada (uso interno) | 90 días |
-          | \`rosariogarage-db\` | BD migrada (dashboard) | 90 días |
-          | \`rosariogarage-pre-migration-db\` | BD original (backup) | 30 días |
-          | \`migration-summary\` | Resumen JSON | 30 días |
-
-          ---
-          *Ver logs de "🔄 Ejecutar migración" y "📊 Comparación" para más detalle*
-          EOF
-          fi
+          client-payload: '{"run_id": "${{ github.run_id }}", "source": "migration"}'
