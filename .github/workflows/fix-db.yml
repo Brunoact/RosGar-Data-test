@@ -1,3 +1,4 @@
+# .github/workflows/fix-db.yml
 name: 🧹 Corregir Base de Datos
 
 on:
@@ -13,6 +14,16 @@ on:
         required: false
         type: boolean
         default: true
+      skip_strategy_c:
+        description: 'Saltar Estrategia C (re-matching versiones)'
+        required: false
+        type: boolean
+        default: false
+      only_strategy_c:
+        description: 'Ejecutar SOLO Estrategia C'
+        required: false
+        type: boolean
+        default: false
 
 env:
   PYTHON_VERSION: '3.11'
@@ -66,7 +77,8 @@ jobs:
           echo ""
           echo "📋 norm_status actual:"
           sqlite3 rosariogarage.db "
-            SELECT COALESCE(norm_status, 'NULL') as status, COUNT(*) as cantidad
+            SELECT COALESCE(norm_status, 'NULL') as status,
+                   COUNT(*) as cantidad
             FROM vehicles
             GROUP BY norm_status
             ORDER BY cantidad DESC;
@@ -75,9 +87,15 @@ jobs:
           echo "🏷️ Top 10 marcas:"
           sqlite3 rosariogarage.db "
             SELECT marca, COUNT(*) as c
-            FROM vehicles WHERE activo = 1 AND marca IS NOT NULL
+            FROM vehicles
+            WHERE activo = 1 AND marca IS NOT NULL
             GROUP BY marca ORDER BY c DESC LIMIT 10;
           "
+          echo ""
+          echo "📋 Columnas actuales:"
+          sqlite3 rosariogarage.db "PRAGMA table_info(vehicles);" | while IFS='|' read num name type notnull dflt pk; do
+            echo "   $name ($type)"
+          done
 
       # ──────────────────────────────────────────────
       # Verificar archivos necesarios
@@ -114,9 +132,11 @@ jobs:
           with open('config/normalizer_dicts.json') as f:
               d = json.load(f)
           meta = d.get('_metadata', {})
+          print(f\"  Versión generador: {meta.get('generator_version', '?')}\")
           print(f\"  Marcas: {meta.get('total_brands', '?')}\")
           print(f\"  Modelos: {meta.get('total_models', '?')}\")
           print(f\"  Versiones: {meta.get('total_versions', '?')}\")
+          print(f\"  Componentes: {meta.get('total_version_components', '?')}\")
           "
 
       # ──────────────────────────────────────────────
@@ -133,12 +153,103 @@ jobs:
       # ──────────────────────────────────────────────
       - name: 🧹 Ejecutar corrección de BD
         run: |
+          ARGS="--db rosariogarage.db --verbose"
+
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "⚡ MODO DRY-RUN"
-            python db_cleaner.py --db rosariogarage.db --dry-run --verbose
-          else
-            python db_cleaner.py --db rosariogarage.db --verbose
+            ARGS="$ARGS --dry-run"
           fi
+
+          if [ "${{ inputs.skip_strategy_c }}" = "true" ]; then
+            echo "⏭️ Saltando Estrategia C"
+            ARGS="$ARGS --skip-c"
+          fi
+
+          if [ "${{ inputs.only_strategy_c }}" = "true" ]; then
+            echo "🎯 Solo Estrategia C"
+            ARGS="$ARGS --only-c"
+          fi
+
+          echo "Ejecutando: python db_cleaner.py $ARGS"
+          python db_cleaner.py $ARGS
+
+      # ──────────────────────────────────────────────
+      # Estadísticas Estrategia C
+      # ──────────────────────────────────────────────
+      - name: 🅲️ Estadísticas Estrategia C
+        if: inputs.dry_run != true
+        run: |
+          echo "🅲️ Estadísticas de Re-matching de versiones:"
+          echo "─────────────────────────────────────"
+
+          # Verificar si existe la tabla changelog
+          HAS_CL=$(sqlite3 rosariogarage.db "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='normalization_changelog';" 2>/dev/null || echo "0")
+
+          if [ "$HAS_CL" = "0" ]; then
+            echo "ℹ️ No hay tabla normalization_changelog"
+          else
+            TOTAL_C=$(sqlite3 rosariogarage.db "
+              SELECT COUNT(*) FROM normalization_changelog
+              WHERE estrategia LIKE 'C_%';
+            " 2>/dev/null || echo "0")
+            echo "Total cambios Estrategia C: $TOTAL_C"
+
+            if [ "$TOTAL_C" -gt "0" ]; then
+              echo ""
+              echo "Detalle por tipo:"
+              sqlite3 rosariogarage.db "
+                SELECT estrategia, COUNT(*) as cantidad
+                FROM normalization_changelog
+                WHERE estrategia LIKE 'C_%'
+                GROUP BY estrategia
+                ORDER BY cantidad DESC;
+              "
+
+              echo ""
+              echo "Últimos 10 re-matches:"
+              sqlite3 rosariogarage.db "
+                SELECT vehicle_id, campo, valor_anterior, valor_nuevo,
+                       razon, confidence
+                FROM normalization_changelog
+                WHERE estrategia = 'C_version_rematch'
+                  AND campo = 'version'
+                ORDER BY fecha DESC
+                LIMIT 10;
+              "
+            fi
+
+            echo ""
+            echo "Total changelog:"
+            sqlite3 rosariogarage.db "
+              SELECT estrategia, COUNT(*) as cantidad
+              FROM normalization_changelog
+              GROUP BY estrategia
+              ORDER BY cantidad DESC;
+            "
+          fi
+
+          echo ""
+          echo "norm_status actual:"
+          sqlite3 rosariogarage.db "
+            SELECT COALESCE(norm_status, 'NULL') as status,
+                   COUNT(*) as cantidad
+            FROM vehicles
+            GROUP BY norm_status
+            ORDER BY cantidad DESC;
+          "
+
+          echo ""
+          echo "📋 Metadata poblada (activos):"
+          sqlite3 rosariogarage.db "
+            SELECT
+              SUM(CASE WHEN puertas IS NOT NULL THEN 1 ELSE 0 END) as con_puertas,
+              SUM(CASE WHEN traccion IS NOT NULL THEN 1 ELSE 0 END) as con_traccion,
+              SUM(CASE WHEN tiene_gnc = 1 THEN 1 ELSE 0 END) as con_gnc,
+              SUM(CASE WHEN es_0km = 1 THEN 1 ELSE 0 END) as con_0km,
+              SUM(CASE WHEN version_raw IS NOT NULL THEN 1 ELSE 0 END) as con_version_raw,
+              SUM(CASE WHEN descripcion IS NOT NULL THEN 1 ELSE 0 END) as con_descripcion
+            FROM vehicles WHERE activo = 1;
+          "
 
       # ──────────────────────────────────────────────
       # Comparar antes/después
@@ -153,6 +264,7 @@ jobs:
           def get_stats(db_path, label):
               conn = sqlite3.connect(db_path)
               stats = {}
+
               stats['total'] = conn.execute(
                   "SELECT COUNT(*) FROM vehicles"
               ).fetchone()[0]
@@ -168,19 +280,50 @@ jobs:
                   "WHERE modelo IS NOT NULL AND modelo != ''"
               ).fetchone()[0]
 
+              # version
+              try:
+                  stats['con_version'] = conn.execute(
+                      "SELECT COUNT(*) FROM vehicles "
+                      "WHERE version IS NOT NULL AND version != ''"
+                  ).fetchone()[0]
+              except Exception:
+                  stats['con_version'] = 0
+
               # norm_status
               rows = conn.execute("""
-                  SELECT COALESCE(norm_status, 'NULL') as s, COUNT(*) as c
-                  FROM vehicles GROUP BY norm_status ORDER BY c DESC
+                  SELECT COALESCE(norm_status, 'NULL') as s,
+                         COUNT(*) as c
+                  FROM vehicles
+                  GROUP BY norm_status ORDER BY c DESC
               """).fetchall()
               stats['norm_status'] = {r[0]: r[1] for r in rows}
 
-              # changelog (solo en corregida)
+              # metadata
+              try:
+                  meta = conn.execute("""
+                      SELECT
+                        SUM(CASE WHEN puertas IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN traccion IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN tiene_gnc = 1 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN es_0km = 1 THEN 1 ELSE 0 END)
+                      FROM vehicles
+                  """).fetchone()
+                  stats['con_puertas'] = meta[0] or 0
+                  stats['con_traccion'] = meta[1] or 0
+                  stats['con_gnc'] = meta[2] or 0
+                  stats['con_0km'] = meta[3] or 0
+              except Exception:
+                  stats['con_puertas'] = 0
+                  stats['con_traccion'] = 0
+                  stats['con_gnc'] = 0
+                  stats['con_0km'] = 0
+
+              # changelog
               try:
                   stats['changelog'] = conn.execute(
                       "SELECT COUNT(*) FROM normalization_changelog"
                   ).fetchone()[0]
-              except:
+              except Exception:
                   stats['changelog'] = 0
 
               try:
@@ -190,8 +333,17 @@ jobs:
                       GROUP BY estrategia ORDER BY c DESC
                   """).fetchall()
                   stats['changes_by_type'] = {r[0]: r[1] for r in rows}
-              except:
+              except Exception:
                   stats['changes_by_type'] = {}
+
+              # Estrategia C específico
+              try:
+                  stats['strategy_c'] = conn.execute(
+                      "SELECT COUNT(*) FROM normalization_changelog "
+                      "WHERE estrategia LIKE 'C_%'"
+                  ).fetchone()[0]
+              except Exception:
+                  stats['strategy_c'] = 0
 
               conn.close()
               return stats
@@ -199,18 +351,32 @@ jobs:
           antes = get_stats('rosariogarage_nofix.db', 'ANTES')
           despues = get_stats('rosariogarage.db', 'DESPUÉS')
 
-          print("=" * 60)
+          print("=" * 65)
           print("📊 COMPARACIÓN ANTES vs DESPUÉS")
-          print("=" * 60)
+          print("=" * 65)
 
           print(f"\n{'Métrica':<30} {'Antes':>10} {'Después':>10} {'Δ':>10}")
-          print("─" * 62)
+          print("─" * 65)
 
           for key, label in [
               ('total', 'Total vehículos'),
               ('activos', 'Activos'),
               ('con_marca', 'Con marca'),
               ('con_modelo', 'Con modelo'),
+              ('con_version', 'Con versión'),
+          ]:
+              a = antes[key]
+              d = despues[key]
+              delta = d - a
+              sign = '+' if delta > 0 else ''
+              print(f"  {label:<28} {a:>10} {d:>10} {sign}{delta:>9}")
+
+          print(f"\n📋 Metadata:")
+          for key, label in [
+              ('con_puertas', 'Con puertas'),
+              ('con_traccion', 'Con tracción'),
+              ('con_gnc', 'Con GNC'),
+              ('con_0km', 'Con 0km'),
           ]:
               a = antes[key]
               d = despues[key]
@@ -235,17 +401,25 @@ jobs:
               for tipo, count in despues['changes_by_type'].items():
                   print(f"  {tipo}: {count}")
 
+          if despues['strategy_c'] > 0:
+              print(f"\n🅲️ Estrategia C: {despues['strategy_c']} cambios")
+
           # Guardar para summary
           summary = {
-              'antes': antes,
-              'despues': despues,
+              'antes': {k: v for k, v in antes.items()
+                        if not isinstance(v, dict)},
+              'despues': {k: v for k, v in despues.items()
+                          if not isinstance(v, dict)},
+              'antes_norm': antes['norm_status'],
+              'despues_norm': despues['norm_status'],
               'cambios_totales': despues['changelog'],
               'cambios_por_tipo': despues['changes_by_type'],
+              'strategy_c': despues['strategy_c'],
           }
           with open('fix_summary.json', 'w') as f:
               json.dump(summary, f, indent=2)
 
-          print("\n" + "=" * 60)
+          print("\n" + "=" * 65)
           PYTHON_SCRIPT
 
       # ──────────────────────────────────────────────
@@ -315,14 +489,57 @@ jobs:
 
           Se ejecutó en modo simulación. No se aplicaron cambios.
           Ver logs del paso "🧹 Ejecutar corrección de BD" para detalles.
+
+          ## ⚙️ Opciones utilizadas
+          | Opción | Valor |
+          |--------|-------|
+          | Dry Run | ✅ Sí |
+          | Skip Estrategia C | **${{ inputs.skip_strategy_c }}** |
+          | Solo Estrategia C | **${{ inputs.only_strategy_c }}** |
           EOF
           else
+            # Leer datos del summary si existe
+            if [ -f fix_summary.json ]; then
+              CAMBIOS=$(jq -r '.cambios_totales // 0' fix_summary.json)
+              STRATEGY_C=$(jq -r '.strategy_c // 0' fix_summary.json)
+              ANTES_FULL=$(jq -r '.antes_norm.full_match // 0' fix_summary.json)
+              DESPUES_FULL=$(jq -r '.despues_norm.full_match // 0' fix_summary.json)
+              ANTES_PARTIAL=$(jq -r '.antes_norm.partial_match // 0' fix_summary.json)
+              DESPUES_PARTIAL=$(jq -r '.despues_norm.partial_match // 0' fix_summary.json)
+              DELTA_FULL=$((DESPUES_FULL - ANTES_FULL))
+              DELTA_PARTIAL=$((DESPUES_PARTIAL - ANTES_PARTIAL))
+            else
+              CAMBIOS="?"
+              STRATEGY_C="?"
+              ANTES_FULL="?"; DESPUES_FULL="?"; DELTA_FULL="?"
+              ANTES_PARTIAL="?"; DESPUES_PARTIAL="?"; DELTA_PARTIAL="?"
+            fi
+
             cat >> $GITHUB_STEP_SUMMARY << EOF
           # 🧹 Corrección de BD Completada
 
           **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
 
+          ## ⚙️ Opciones utilizadas
+          | Opción | Valor |
+          |--------|-------|
+          | Dry Run | ❌ No |
+          | Skip Estrategia C | **${{ inputs.skip_strategy_c }}** |
+          | Solo Estrategia C | **${{ inputs.only_strategy_c }}** |
+
           ## 📊 Resultados
+
+          | Métrica | Valor |
+          |---------|-------|
+          | 📝 Total cambios aplicados | **${CAMBIOS}** |
+          | 🅲️ Cambios Estrategia C | **${STRATEGY_C}** |
+
+          ## 🔧 Normalización
+
+          | Estado | Antes | Después | Δ |
+          |--------|-------|---------|---|
+          | ✅ full_match | ${ANTES_FULL} | ${DESPUES_FULL} | **+${DELTA_FULL}** |
+          | 🟡 partial_match | ${ANTES_PARTIAL} | ${DESPUES_PARTIAL} | **${DELTA_PARTIAL}** |
 
           Ver logs del paso "📊 Comparar ANTES vs DESPUÉS" para el detalle completo.
 
