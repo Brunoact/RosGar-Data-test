@@ -634,8 +634,8 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
             # ══════════════════════════════════════════
             # GUARDA 1: No "mejorar" modelo si el original
             # es más específico (contiene al nuevo)
-            # Ejemplo: "c3 aircross" → "c3" es INCORRECTO
-            #          "hrv" → "hr-v" es CORRECTO (alias)
+            # "c3 aircross" → "c3" es INCORRECTO
+            # "hrv" → "hr-v" es CORRECTO (alias)
             # ══════════════════════════════════════════
             new_modelo = norm.get('modelo')
             model_changed = False
@@ -644,16 +644,14 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
                 modelo_lower = modelo.lower().strip()
                 new_modelo_lower = new_modelo.lower().strip()
 
-                # Rechazar si el modelo original CONTIENE
-                # al nuevo (más específico → más genérico)
                 is_subset = (
                     new_modelo_lower in modelo_lower
                     and new_modelo_lower != modelo_lower
-                    and len(modelo_lower) > len(new_modelo_lower) + 1
+                    and len(modelo_lower)
+                        > len(new_modelo_lower) + 1
                 )
 
                 if is_subset:
-                    # El original es más específico, no cambiar
                     if len(examples_skipped_model) < 10:
                         examples_skipped_model.append({
                             'id': vid,
@@ -674,15 +672,15 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
 
             # ══════════════════════════════════════════
             # GUARDA 2: No asignar versión si no había
-            # input de versión (evitar falsos positivos)
+            # input de versión real
             # ══════════════════════════════════════════
             new_version = norm.get('version')
             if new_version and not version:
-                # Solo aceptar si había version_input real
                 has_real_input = (
                     version_input
                     and len(version_input.strip()) >= 3
-                    and version_input.strip().lower() != modelo.lower().strip()
+                    and version_input.strip().lower()
+                        != modelo.lower().strip()
                 )
 
                 if has_real_input:
@@ -709,7 +707,9 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
                             'id': vid,
                             'marca': marca,
                             'modelo': modelo,
-                            'input': repr(version_input[:30]),
+                            'input': repr(
+                                version_input[:30]
+                            ),
                             'proposed': new_version,
                             'reason': 'sin input real',
                         })
@@ -718,16 +718,15 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
             old_rank = STATUS_RANK.get(old_status, 0)
             new_rank = STATUS_RANK.get(new_status, 0)
             if new_rank > old_rank:
-                # Si se propuso versión pero se rechazó,
-                # no subir a full_match
                 if (new_status == 'full_match'
                         and 'version' not in updates
                         and not version):
-                    # Máximo partial_match
                     if STATUS_RANK.get(
                         'partial_match', 0
                     ) > old_rank:
-                        updates['norm_status'] = 'partial_match'
+                        updates['norm_status'] = (
+                            'partial_match'
+                        )
                         STATS.renorm_status_upgraded += 1
                         if len(examples_status) < 10:
                             examples_status.append({
@@ -842,7 +841,8 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
             logger.info(
                 f"      [{ex['id']}] {ex['marca']} "
                 f"{ex['modelo']}: input={ex['input']} → "
-                f"propuso '{ex['proposed']}' — {ex['reason']}"
+                f"propuso '{ex['proposed']}' — "
+                f"{ex['reason']}"
             )
 
     if examples_model:
@@ -872,7 +872,9 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
             f"\n   📋 {prefix}Ejemplos - Status upgrades:"
         )
         for ex in examples_status[:5]:
-            note = f" ({ex['note']})" if 'note' in ex else ''
+            note = (
+                f" ({ex['note']})" if 'note' in ex else ''
+            )
             logger.info(
                 f"      [{ex['id']}] {ex['old']} → "
                 f"{ex['new']}{note}"
