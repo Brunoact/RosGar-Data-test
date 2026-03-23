@@ -1,14 +1,18 @@
 """
-🚗 Scraper RosarioGarage - Versión Producción v2.5
+🚗 Scraper RosarioGarage - Versión Producción v2.6
 ==================================================
 Extrae datos de cada publicación y normaliza contra catálogo.
 Si no encuentra en catálogo, usa datos originales.
 NUNCA deja marca vacía ni marca sin modelo.
 
-v2.5: Integración con normalizer_v2 (v4.1)
-- Pasa año_raw, km_raw, precio_raw al normalizador
-- Aprovecha año corregido del normalizador (años basura, desc)
-- Log de warnings/corrections en modo debug
+v2.6: Campos nuevos + integración normalizer_v2 (v5.0)
+  - Extrae puertas, tracción, GNC, 0km de version_raw y descripción
+  - Guarda version_raw_original (antes de clean_text)
+  - Guarda descripcion completa
+  - Pre-limpia version_raw antes de pasar al normalizer
+  - Pasa campos extraídos como contexto adicional
+  - norm_confidence almacenado
+  - Schema SQL actualizado con 7 columnas nuevas
 """
 
 import httpx
@@ -33,10 +37,8 @@ except ImportError:
 
 try:
     from normalizer_v2 import (
-        init_normalizer,
-        normalize_vehicle,
-        get_normalization_stats,
-        extract_urgency_signals
+        init_normalizer, normalize_vehicle,
+        get_normalization_stats, extract_urgency_signals
     )
     HAS_NORMALIZER = True
 except ImportError:
@@ -44,7 +46,10 @@ except ImportError:
 
 # --- CONFIG ---
 BASE_URL = "https://www.rosariogarage.com"
-LISTING_URL = "https://www.rosariogarage.com/index.php?action=carro/showRubro&rbrId=107"
+LISTING_URL = (
+    "https://www.rosariogarage.com/index.php"
+    "?action=carro/showRubro&rbrId=107"
+)
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
 ITEMS_PER_PAGE = 95
 MAX_PAGES = 100
@@ -52,7 +57,9 @@ MASTER_DB = 'rosariogarage.db'
 WORKER_DB_PREFIX = 'rosariogarage_worker_'
 WORKER_ID = int(os.environ.get('WORKER_ID', 0))
 TOTAL_WORKERS = int(os.environ.get('TOTAL_WORKERS', 1))
-CONSOLIDATE_MODE = os.environ.get('CONSOLIDATE_MODE', 'false').lower() == 'true'
+CONSOLIDATE_MODE = (
+    os.environ.get('CONSOLIDATE_MODE', 'false').lower() == 'true'
+)
 WORKER_DB = f'{WORKER_DB_PREFIX}{WORKER_ID}.db'
 
 
@@ -119,15 +126,25 @@ def fatal_error(msg: str, e: Exception = None):
 HTML_ENTITIES = str.maketrans({'\xa0': ' '})
 ENTITY_PATTERN = re.compile(r'&(\w+);')
 ENTITY_MAP = {
-    'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á',
-    'eacute': 'é', 'iacute': 'í', 'uacute': 'ú',
-    'ntilde': 'ñ', 'amp': '&'
+    'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á', 'eacute': 'é',
+    'iacute': 'í', 'uacute': 'ú', 'ntilde': 'ñ', 'amp': '&'
 }
 
 RE_DIGITS = re.compile(r'[^\d]')
 RE_PRICE = re.compile(r'(\d+\.?\d*)')
 RE_WHATSAPP = re.compile(r'wa\.me/(\d+)\?', re.I)
 RE_YEAR = re.compile(r'^(19|20)\d{2}$')
+
+# ── NUEVOS v2.6 ──
+RE_PUERTAS = re.compile(r'\b([345])\s*[pP](?:uertas?)?\b')
+RE_TRACCION = re.compile(
+    r'\b(4x[24])\b|\b(AWD|FWD|RWD)\b', re.IGNORECASE
+)
+RE_GNC = re.compile(
+    r'\bGNC\b|\bgas\s*natural\b|\bc[/\s]?GNC\b|\bcon\s+GNC\b',
+    re.IGNORECASE
+)
+RE_0KM = re.compile(r'\b0\s*km\b|\bcero\s*km\b|\bokm\b', re.IGNORECASE)
 
 
 def clean_text(text: str) -> str:
@@ -151,7 +168,7 @@ def clean_html(html: str) -> str:
 def decode_response(resp: httpx.Response) -> str:
     try:
         return resp.content.decode('iso-8859-1', errors='ignore')
-    except:
+    except Exception:
         return resp.text
 
 
@@ -181,7 +198,8 @@ def find_worker_databases() -> List[Tuple[int, str]]:
 
 
 def generate_fingerprint(
-    marca: str, modelo: str, año: int, km: int, whatsapp: str = None
+    marca: str, modelo: str, año: int, km: int,
+    whatsapp: str = None
 ) -> str:
     km_rango = (km // 5000) * 5000 if km else 0
     parts = [
@@ -199,7 +217,7 @@ def parse_km(s) -> int:
         return 0
     try:
         return int(RE_DIGITS.sub('', str(s))) or 0
-    except:
+    except Exception:
         return 0
 
 
@@ -212,7 +230,7 @@ def parse_year(s) -> Optional[int]:
             y = int(digits)
             if 1950 <= y <= 2030:
                 return y
-    except:
+    except Exception:
         pass
     return None
 
@@ -237,10 +255,15 @@ def parse_precio(s: str, dolar: float) -> Optional[float]:
         if m:
             val = float(m.group(1))
             is_usd = any(
-                x in s.upper() for x in ['U$S', 'USD', 'U$D', 'DÓLAR']
+                x in s.upper()
+                for x in ['U$S', 'USD', 'U$D', 'DÓLAR']
             )
-            return val if is_usd else round(val / dolar, 2) if dolar else None
-    except:
+            return (
+                val if is_usd
+                else round(val / dolar, 2) if dolar
+                else None
+            )
+    except Exception:
         pass
     return None
 
@@ -249,7 +272,10 @@ def is_particular(s: str) -> int:
     if not s:
         return 1
     t = s.lower()
-    return 1 if any(x in t for x in ['due', 'particular', 'directo']) else 0
+    return (
+        1 if any(x in t for x in ['due', 'particular', 'directo'])
+        else 0
+    )
 
 
 def extract_model_from_version(version: str, marca: str = "") -> str:
@@ -297,14 +323,23 @@ CREATE TABLE IF NOT EXISTS vehicles (
     ultima_vista DATE NOT NULL,
     activo INTEGER DEFAULT 1,
     dias_publicado INTEGER DEFAULT 0,
-    norm_status TEXT DEFAULT 'pending'
+    norm_status TEXT DEFAULT 'pending',
+    puertas INTEGER,
+    traccion TEXT,
+    tiene_gnc INTEGER DEFAULT 0,
+    es_0km INTEGER DEFAULT 0,
+    version_raw TEXT,
+    descripcion TEXT,
+    norm_confidence INTEGER DEFAULT 0
 );
+
 CREATE INDEX IF NOT EXISTS idx_activo ON vehicles(activo);
-CREATE INDEX IF NOT EXISTS idx_mercado ON vehicles(marca, modelo, año)
-    WHERE activo = 1;
-CREATE INDEX IF NOT EXISTS idx_precio ON vehicles(precio_usd)
-    WHERE activo = 1;
+CREATE INDEX IF NOT EXISTS idx_mercado
+    ON vehicles(marca, modelo, año) WHERE activo = 1;
+CREATE INDEX IF NOT EXISTS idx_precio
+    ON vehicles(precio_usd) WHERE activo = 1;
 CREATE INDEX IF NOT EXISTS idx_fingerprint ON vehicles(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_norm_status ON vehicles(norm_status);
 
 CREATE TABLE IF NOT EXISTS price_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,12 +347,15 @@ CREATE TABLE IF NOT EXISTS price_history (
     precio_usd REAL,
     fecha DATE NOT NULL,
     variacion_pct REAL,
-    FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
+    FOREIGN KEY (vehicle_id)
+        REFERENCES vehicles(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_hist_vehicle ON price_history(vehicle_id);
+CREATE INDEX IF NOT EXISTS idx_hist_vehicle
+    ON price_history(vehicle_id);
 
 CREATE TABLE IF NOT EXISTS scrape_metadata (
-    key TEXT PRIMARY KEY, value TEXT
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS republication_log (
@@ -329,6 +367,30 @@ CREATE TABLE IF NOT EXISTS republication_log (
     dias_acumulados INTEGER
 );
 """
+
+
+def _ensure_columns_sync(conn):
+    """Agrega columnas nuevas v2.6 si no existen (sync)."""
+    cursor = conn.execute("PRAGMA table_info(vehicles)")
+    existing = {row[1] for row in cursor.fetchall()}
+    new_cols = {
+        'puertas': 'INTEGER',
+        'traccion': 'TEXT',
+        'tiene_gnc': 'INTEGER DEFAULT 0',
+        'es_0km': 'INTEGER DEFAULT 0',
+        'version_raw': 'TEXT',
+        'descripcion': 'TEXT',
+        'norm_confidence': 'INTEGER DEFAULT 0',
+    }
+    for col, col_type in new_cols.items():
+        if col not in existing:
+            try:
+                conn.execute(
+                    f"ALTER TABLE vehicles ADD COLUMN {col} {col_type}"
+                )
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
 
 
 async def init_worker_db(path: str):
@@ -372,8 +434,12 @@ class HTTPClient:
             limits=limits, timeout=timeout,
             follow_redirects=True, http2=True
         )
-        self.sem_list = asyncio.Semaphore(CONFIG.max_concurrent_listings)
-        self.sem_detail = asyncio.Semaphore(CONFIG.max_concurrent_details)
+        self.sem_list = asyncio.Semaphore(
+            CONFIG.max_concurrent_listings
+        )
+        self.sem_detail = asyncio.Semaphore(
+            CONFIG.max_concurrent_details
+        )
         logger.info("🌐 HTTP Client listo")
         return self
 
@@ -402,12 +468,14 @@ class HTTPClient:
                         )
                         continue
                     return None
-                except (httpx.TimeoutException, httpx.ConnectError):
+                except (
+                    httpx.TimeoutException, httpx.ConnectError
+                ):
                     if attempt < CONFIG.max_retries - 1:
                         await asyncio.sleep(
                             CONFIG.retry_delay * (attempt + 1)
                         )
-                except:
+                except Exception:
                     pass
             STATS.requests_failed += 1
             return None
@@ -443,7 +511,7 @@ async def get_dolar() -> float:
                     if 100 < v < 5000:
                         logger.info(f"💵 Dólar: ${v:.2f}")
                         return v
-            except:
+            except Exception:
                 continue
     fatal_error("No se pudo obtener dólar")
 
@@ -465,7 +533,7 @@ def parse_listing_item(div) -> Optional[Dict]:
         if url and not url.startswith('http'):
             url = f"{BASE_URL}/{url.lstrip('/')}"
         return {'id': item_id, 'url': url}
-    except:
+    except Exception:
         return None
 
 
@@ -481,7 +549,7 @@ async def fetch_listing_page(
             v for d in soup.select('div[data-rel]')
             if (v := parse_listing_item(d))
         ]
-    except:
+    except Exception:
         return []
 
 
@@ -500,7 +568,6 @@ async def fetch_listings(http: HTTPClient) -> List[Dict]:
             *[fetch_listing_page(http, o) for o in batch],
             return_exceptions=True
         )
-
         new = 0
         all_empty = True
         for res in results:
@@ -513,14 +580,12 @@ async def fetch_listings(http: HTTPClient) -> List[Dict]:
                         seen.add(v['id'])
                         vehicles.append(v)
                         new += 1
-
         if all_empty:
             empty += 1
             if empty >= 2:
                 break
         else:
             empty = 0
-
         logger.info(f"  +{new} | Total: {len(vehicles)}")
         if CONFIG.delay_between_batches > 0:
             await asyncio.sleep(CONFIG.delay_between_batches)
@@ -542,7 +607,8 @@ def extract_field(box, name: str) -> Optional[str]:
         if name.lower() in span.get_text().lower():
             nxt = span.next_sibling
             if nxt:
-                return clean_text(str(nxt)).lstrip(':').strip() or None
+                val = clean_text(str(nxt)).lstrip(':').strip()
+                return val or None
     return None
 
 
@@ -552,6 +618,7 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
         'titulo': None,
         'marca_raw': None,
         'version_raw': None,
+        'version_raw_original': None,
         'año': None,
         'kilometros': 0,
         'transmision': None,
@@ -565,6 +632,11 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
         'visitas': None,
         'expira_dias': None,
         'descripcion': None,
+        # ── NUEVOS v2.6 ──
+        'puertas': None,
+        'traccion': None,
+        'tiene_gnc': 0,
+        'es_0km': 0,
     }
 
     # Título
@@ -574,7 +646,7 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
             parts = clean_text(title.get_text()).split(' - ')
             if len(parts) >= 2:
                 data['titulo'] = parts[1].strip()
-    except:
+    except Exception:
         pass
 
     # Descripción del anuncio
@@ -582,12 +654,30 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
     for sub in soup.find_all('div', class_='subtitle'):
         t = clean_text(sub.get_text()).lower()
         if 'descripci' in t and 'anuncio' in t:
-            desc_box = sub.find_next_sibling('div', class_='box-text')
+            desc_box = sub.find_next_sibling(
+                'div', class_='box-text'
+            )
             break
 
     if desc_box:
         data['marca_raw'] = extract_field(desc_box, 'Marca')
-        data['version_raw'] = extract_field(desc_box, 'Versi')
+
+        # Extraer versión: guardar ORIGINAL antes de clean_text
+        version_span_raw = None
+        for span in desc_box.find_all('span'):
+            if 'versi' in span.get_text().lower():
+                nxt = span.next_sibling
+                if nxt:
+                    version_span_raw = str(nxt).strip().lstrip(':').strip()
+                    break
+
+        if version_span_raw:
+            data['version_raw_original'] = version_span_raw
+            data['version_raw'] = clean_text(version_span_raw)
+        else:
+            data['version_raw'] = extract_field(desc_box, 'Versi')
+            data['version_raw_original'] = data['version_raw']
+
         data['año'] = parse_year(
             extract_field(desc_box, 'Año')
             or extract_field(desc_box, 'Ano')
@@ -635,7 +725,7 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
             m = RE_WHATSAPP.search(wa.get('href', ''))
             if m:
                 data['whatsapp'] = m.group(1)
-    except:
+    except Exception:
         pass
 
     # Avisos publicados
@@ -647,7 +737,7 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
                 digits = RE_DIGITS.sub('', span.get_text())
                 if digits:
                     data['avisos_vendedor'] = int(digits)
-    except:
+    except Exception:
         pass
 
     # Descripción ampliada
@@ -678,6 +768,35 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
                         d = RE_DIGITS.sub('', str(nxt))
                         if d:
                             data['expira_dias'] = int(d)
+
+    # ═══ EXTRAER CAMPOS NUEVOS v2.6 ═══
+    search_fields = ' '.join(filter(None, [
+        data.get('version_raw', ''),
+        data.get('descripcion', ''),
+    ]))
+
+    # Puertas
+    m = RE_PUERTAS.search(search_fields)
+    if m:
+        data['puertas'] = int(m.group(1))
+
+    # Tracción
+    m = RE_TRACCION.search(search_fields)
+    if m:
+        data['traccion'] = (m.group(1) or m.group(2)).lower()
+
+    # GNC
+    if RE_GNC.search(search_fields):
+        data['tiene_gnc'] = 1
+
+    # 0km
+    km = data.get('kilometros', 0)
+    combined_0km = ' '.join(filter(None, [
+        data.get('version_raw', ''),
+        data.get('descripcion', ''),
+    ]))
+    if km == 0 and RE_0KM.search(combined_0km):
+        data['es_0km'] = 1
 
     return data
 
@@ -711,6 +830,14 @@ async def fetch_vehicle_details(
         'expira_dias': None,
         'tiene_urgencia': 0,
         'norm_status': 'pending',
+        # ── NUEVOS v2.6 ──
+        'puertas': None,
+        'traccion': None,
+        'tiene_gnc': 0,
+        'es_0km': 0,
+        'version_raw': None,
+        'descripcion': None,
+        'norm_confidence': 0,
     }
 
     r = await http.fetch_detail(url)
@@ -733,15 +860,46 @@ async def fetch_vehicle_details(
         result['whatsapp'] = raw['whatsapp']
         result['visitas'] = raw['visitas']
         result['expira_dias'] = raw['expira_dias']
-        result['precio_usd'] = parse_precio(raw['precio_text'], dolar)
+        result['precio_usd'] = parse_precio(
+            raw['precio_text'], dolar
+        )
+
+        # ═══ NUEVOS v2.6: copiar campos extraídos ═══
+        result['puertas'] = raw.get('puertas')
+        result['traccion'] = raw.get('traccion')
+        result['tiene_gnc'] = raw.get('tiene_gnc', 0)
+        result['es_0km'] = raw.get('es_0km', 0)
+        result['descripcion'] = raw.get('descripcion')
+
+        # Guardar version_raw ORIGINAL (sin clean_text)
+        result['version_raw'] = (
+            raw.get('version_raw_original')
+            or raw.get('version_raw')
+        )
 
         # ═══════════════════════════════════════════════════════
-        # 🎯 NORMALIZACIÓN v2
+        # 🎯 NORMALIZACIÓN v2.6
         # ═══════════════════════════════════════════════════════
+
         marca_raw = (raw.get('marca_raw') or '').strip()
         version_raw = (raw.get('version_raw') or '').strip()
         titulo = (raw.get('titulo') or '').strip()
         descripcion = raw.get('descripcion') or ''
+
+        # Pre-limpieza: quitar marca de version_raw si ya se conoce
+        version_for_norm = version_raw
+        if marca_raw and version_for_norm:
+            version_for_norm = re.sub(
+                r'\b' + re.escape(marca_raw) + r'\b',
+                '', version_for_norm, flags=re.IGNORECASE
+            ).strip()
+            # También sin guiones
+            marca_nohyphen = marca_raw.replace('-', ' ')
+            if marca_nohyphen != marca_raw:
+                version_for_norm = re.sub(
+                    r'\b' + re.escape(marca_nohyphen) + r'\b',
+                    '', version_for_norm, flags=re.IGNORECASE
+                ).strip()
 
         if HAS_NORMALIZER:
             try:
@@ -749,12 +907,8 @@ async def fetch_vehicle_details(
                     titulo=titulo,
                     descripcion=descripcion,
                     marca_raw=marca_raw,
-                    # modelo_raw vacío: RosarioGarage no tiene campo
-                    # "modelo" separado. El normalizer lo infiere
-                    # de version_raw, titulo y descripcion.
                     modelo_raw="",
-                    version_raw=version_raw,
-                    # ── NUEVO v2.5: pasar año, km y precio ──
+                    version_raw=version_for_norm,
                     año_raw=raw['año'],
                     km_raw=raw['kilometros'],
                     precio_raw=result['precio_usd'],
@@ -766,10 +920,11 @@ async def fetch_vehicle_details(
                 result['norm_status'] = norm.get(
                     'norm_status', 'fallback'
                 )
+                result['norm_confidence'] = norm.get(
+                    'confidence', 0
+                )
 
-                # ── NUEVO v2.5: usar año corregido si el
-                #    normalizer detectó año basura y encontró
-                #    uno mejor en descripción/título ──
+                # Usar año corregido del normalizer
                 año_detectado = norm.get('año_detectado')
                 if año_detectado and norm.get('año_fuente') in (
                     'description', 'title', 'text'
@@ -783,7 +938,23 @@ async def fetch_vehicle_details(
                             )
                         result['año'] = año_detectado
 
-                # ── NUEVO v2.5: log de warnings en debug ──
+                # Extraer metadata del normalizer si no se
+                # obtuvo del HTML
+                extracted = norm.get('extracted_data', {})
+                if (extracted.get('puertas')
+                        and not result['puertas']):
+                    result['puertas'] = extracted['puertas']
+                if (extracted.get('traccion')
+                        and not result['traccion']):
+                    result['traccion'] = extracted['traccion']
+                if (extracted.get('tiene_gnc')
+                        and not result['tiene_gnc']):
+                    result['tiene_gnc'] = 1
+                if (extracted.get('es_0km')
+                        and not result['es_0km']):
+                    result['es_0km'] = 1
+
+                # Log warnings en debug
                 if DEBUG_MODE and norm.get('warnings'):
                     for w in norm['warnings']:
                         logger.debug(
@@ -807,19 +978,16 @@ async def fetch_vehicle_details(
         # FALLBACK: NUNCA dejar marca vacía ni marca sin modelo
         # ═══════════════════════════════════════════════════════
 
-        # Si no hay marca, usar la original
         if not result['marca']:
             result['marca'] = (
                 marca_raw.lower() if marca_raw else None
             )
 
-        # Si aún no hay marca, intentar extraer del título
         if not result['marca'] and titulo:
             words = titulo.lower().split()
             if words:
                 result['marca'] = words[0]
 
-        # Si hay marca pero no modelo, extraer de version_raw o título
         if result['marca'] and not result['modelo']:
             model = extract_model_from_version(
                 version_raw, result['marca']
@@ -830,13 +998,11 @@ async def fetch_vehicle_details(
                 )
             result['modelo'] = model if model else None
 
-        # Si sigue sin modelo, usar primera palabra de version_raw
         if (result['marca'] and not result['modelo']
                 and version_raw):
             words = version_raw.lower().split()
             for w in words:
-                if (len(w) >= 2
-                        and not RE_YEAR.match(w)
+                if (len(w) >= 2 and not RE_YEAR.match(w)
                         and w != result['marca']):
                     result['modelo'] = w
                     break
@@ -848,7 +1014,7 @@ async def fetch_vehicle_details(
                 result['tiene_urgencia'] = (
                     1 if urg.get('has_urgency') else 0
                 )
-            except:
+            except Exception:
                 pass
 
         # Fingerprint
@@ -871,15 +1037,17 @@ async def fetch_all_details(
 ) -> List[Dict]:
     total = len(vehicles)
     logger.info(f"🚗 Extrayendo detalles de {total} vehículos...")
-
     results = []
+
     for i in range(0, total, CONFIG.batch_size):
         batch = vehicles[i:i + CONFIG.batch_size]
         batch_results = await asyncio.gather(
-            *[fetch_vehicle_details(http, v, dolar) for v in batch],
+            *[
+                fetch_vehicle_details(http, v, dolar)
+                for v in batch
+            ],
             return_exceptions=True
         )
-
         for r in batch_results:
             if r and not isinstance(r, Exception):
                 results.append(r)
@@ -894,7 +1062,6 @@ async def fetch_all_details(
             f"OK: {len(results)} | "
             f"Marca: {with_marca} | Modelo: {with_modelo}"
         )
-
         if CONFIG.delay_between_batches > 0:
             await asyncio.sleep(CONFIG.delay_between_batches)
 
@@ -910,7 +1077,6 @@ async def fetch_all_details(
 
 async def save_worker_results(results: List[Dict], dolar: float):
     today = date.today().isoformat()
-
     with_marca = sum(1 for v in results if v.get('marca'))
     with_modelo = sum(
         1 for v in results
@@ -964,30 +1130,44 @@ async def save_worker_results(results: List[Dict], dolar: float):
         for v in results:
             await db.execute("""
                 INSERT OR REPLACE INTO vehicles (
-                    id, url, fingerprint, marca, modelo, version,
+                    id, url, fingerprint,
+                    marca, modelo, version,
                     año, kilometros, transmision, combustible,
                     precio_usd, es_particular, avisos_vendedor,
-                    whatsapp, ciudad, provincia, visitas,
-                    expira_dias, tiene_urgencia,
-                    primera_vista, ultima_vista, activo, norm_status
+                    whatsapp, ciudad, provincia,
+                    visitas, expira_dias, tiene_urgencia,
+                    primera_vista, ultima_vista, activo,
+                    norm_status,
+                    puertas, traccion, tiene_gnc, es_0km,
+                    version_raw, descripcion, norm_confidence
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
+                    ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?, 1, ?
+                    ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, 1,
+                    ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?
                 )
             """, (
                 v['id'], v['url'], v['fingerprint'],
                 v['marca'], v['modelo'], v['version'],
-                v['año'], v['kilometros'], v['transmision'],
-                v['combustible'], v['precio_usd'],
-                v['es_particular'], v['avisos_vendedor'],
+                v['año'], v['kilometros'],
+                v['transmision'], v['combustible'],
+                v['precio_usd'], v['es_particular'],
+                v['avisos_vendedor'],
                 v['whatsapp'], v['ciudad'], v['provincia'],
                 v['visitas'], v['expira_dias'],
                 v['tiene_urgencia'],
-                today, today, v['norm_status']
+                today, today,
+                v['norm_status'],
+                v.get('puertas'), v.get('traccion'),
+                v.get('tiene_gnc', 0), v.get('es_0km', 0),
+                v.get('version_raw'), v.get('descripcion'),
+                v.get('norm_confidence', 0),
             ))
 
         await db.commit()
@@ -1012,12 +1192,17 @@ def read_worker_data(path: str) -> Tuple[List[tuple], Dict]:
             "SELECT key, value FROM scrape_metadata"
         ):
             metadata[row['key']] = row['value']
+
         cursor = conn.execute("""
-            SELECT id, url, fingerprint, marca, modelo, version,
+            SELECT id, url, fingerprint,
+                   marca, modelo, version,
                    año, kilometros, transmision, combustible,
                    precio_usd, es_particular, avisos_vendedor,
-                   whatsapp, ciudad, provincia, visitas,
-                   expira_dias, tiene_urgencia, norm_status
+                   whatsapp, ciudad, provincia,
+                   visitas, expira_dias, tiene_urgencia,
+                   norm_status,
+                   puertas, traccion, tiene_gnc, es_0km,
+                   version_raw, descripcion, norm_confidence
             FROM vehicles
         """)
         vehicles = [tuple(row) for row in cursor]
@@ -1033,6 +1218,7 @@ def consolidate():
     logger.info("=" * 60)
 
     today = date.today().isoformat()
+
     workers = find_worker_databases()
     if not workers:
         fatal_error("Sin workers")
@@ -1041,7 +1227,9 @@ def consolidate():
 
     all_data = []
     dolar = None
-    stats = {'marca': 0, 'modelo': 0, 'full': 0, 'partial': 0}
+    stats = {
+        'marca': 0, 'modelo': 0, 'full': 0, 'partial': 0
+    }
 
     for wid, path in workers:
         vehicles, meta = read_worker_data(path)
@@ -1073,6 +1261,9 @@ def consolidate():
 
     conn = sqlite3.connect(MASTER_DB)
 
+    # Migrar schema: agregar columnas nuevas v2.6
+    _ensure_columns_sync(conn)
+
     # Migración: reparar datos corruptos
     conn.execute(
         "UPDATE vehicles SET ultima_vista = primera_vista "
@@ -1102,9 +1293,9 @@ def consolidate():
     seen = set()
     for wid, vehicles, _ in all_data:
         for v in vehicles:
-            vid = v[0]
+            vid = v[0]  # id
             seen.add(vid)
-            precio = v[10]
+            precio = v[10]  # precio_usd
 
             existing = cursor.execute(
                 "SELECT precio_usd, primera_vista "
@@ -1113,26 +1304,54 @@ def consolidate():
 
             if existing:
                 old_precio = existing[0]
+                # UPDATE con campos nuevos
+                # v[1:19] = url..tiene_urgencia
+                # v[19]   = norm_status
+                # v[20:27] = puertas..norm_confidence
                 cursor.execute("""
                     UPDATE vehicles SET
-                        url=?, fingerprint=?, marca=?, modelo=?,
-                        version=?, año=?, kilometros=?,
-                        transmision=?, combustible=?, precio_usd=?,
+                        url=?, fingerprint=?,
+                        marca=?, modelo=?, version=?,
+                        año=?, kilometros=?,
+                        transmision=?, combustible=?,
+                        precio_usd=?,
                         es_particular=?, avisos_vendedor=?,
                         whatsapp=?, ciudad=?, provincia=?,
-                        visitas=?, expira_dias=?, tiene_urgencia=?,
+                        visitas=?, expira_dias=?,
+                        tiene_urgencia=?,
                         ultima_vista=?, activo=1,
                         dias_publicado=julianday(?)-julianday(primera_vista),
-                        norm_status=?
+                        norm_status=?,
+                        puertas=?, traccion=?,
+                        tiene_gnc=?, es_0km=?,
+                        version_raw=?, descripcion=?,
+                        norm_confidence=?
                     WHERE id=?
                 """, (
-                    *v[1:19], today, today, v[19], vid
+                    v[1], v[2],          # url, fingerprint
+                    v[3], v[4], v[5],    # marca, modelo, version
+                    v[6], v[7],          # año, kilometros
+                    v[8], v[9],          # transmision, combustible
+                    v[10],               # precio_usd
+                    v[11], v[12],        # es_particular, avisos
+                    v[13], v[14], v[15], # whatsapp, ciudad, prov
+                    v[16], v[17],        # visitas, expira_dias
+                    v[18],               # tiene_urgencia
+                    today, today,        # ultima_vista, julianday
+                    v[19],               # norm_status
+                    v[20], v[21],        # puertas, traccion
+                    v[22], v[23],        # tiene_gnc, es_0km
+                    v[24], v[25],        # version_raw, descripcion
+                    v[26],               # norm_confidence
+                    vid                  # WHERE id=?
                 ))
                 STATS.vehicles_updated += 1
 
                 if (old_precio and precio
                         and abs(old_precio - precio) > 0.01):
-                    var = ((precio - old_precio) / old_precio) * 100
+                    var = (
+                        (precio - old_precio) / old_precio
+                    ) * 100
                     cursor.execute(
                         "INSERT INTO price_history "
                         "VALUES (NULL, ?, ?, ?, ?)",
@@ -1140,12 +1359,62 @@ def consolidate():
                     )
                     STATS.vehicles_price_changed += 1
             else:
+                # INSERT con campos nuevos
                 cursor.execute("""
-                    INSERT INTO vehicles VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?
+                    INSERT INTO vehicles (
+                        id, url, fingerprint,
+                        marca, modelo, version,
+                        año, kilometros,
+                        transmision, combustible,
+                        precio_usd,
+                        es_particular, avisos_vendedor,
+                        whatsapp, ciudad, provincia,
+                        visitas, expira_dias,
+                        tiene_urgencia,
+                        primera_vista, ultima_vista,
+                        activo, dias_publicado,
+                        norm_status,
+                        puertas, traccion,
+                        tiene_gnc, es_0km,
+                        version_raw, descripcion,
+                        norm_confidence
+                    ) VALUES (
+                        ?, ?, ?,
+                        ?, ?, ?,
+                        ?, ?,
+                        ?, ?,
+                        ?,
+                        ?, ?,
+                        ?, ?, ?,
+                        ?, ?,
+                        ?,
+                        ?, ?,
+                        1, 0,
+                        ?,
+                        ?, ?,
+                        ?, ?,
+                        ?, ?,
+                        ?
                     )
-                """, (*v[:19], today, today, v[19]))
+                """, (
+                    v[0], v[1], v[2],    # id, url, fingerprint
+                    v[3], v[4], v[5],    # marca, modelo, version
+                    v[6], v[7],          # año, kilometros
+                    v[8], v[9],          # transmision, combustible
+                    v[10],               # precio_usd
+                    v[11], v[12],        # es_particular, avisos
+                    v[13], v[14], v[15], # whatsapp, ciudad, prov
+                    v[16], v[17],        # visitas, expira_dias
+                    v[18],               # tiene_urgencia
+                    today, today,        # primera/ultima_vista
+                    # activo=1, dias_publicado=0 (hardcoded)
+                    v[19],               # norm_status
+                    v[20], v[21],        # puertas, traccion
+                    v[22], v[23],        # tiene_gnc, es_0km
+                    v[24], v[25],        # version_raw, descripcion
+                    v[26],               # norm_confidence
+                ))
+
                 if precio:
                     cursor.execute(
                         "INSERT INTO price_history "
@@ -1194,7 +1463,7 @@ def consolidate():
     for _, path in workers:
         try:
             os.remove(path)
-        except:
+        except Exception:
             pass
 
     logger.info("\n" + "=" * 60)
@@ -1262,8 +1531,10 @@ async def run_worker():
     if HAS_NORMALIZER:
         try:
             norm_stats = get_normalization_stats()
-            logger.info(f"\n📊 Normalizer: {norm_stats.summary()}")
-        except:
+            logger.info(
+                f"\n📊 Normalizer: {norm_stats.summary()}"
+            )
+        except Exception:
             pass
 
     logger.info("\n" + "=" * 60)
