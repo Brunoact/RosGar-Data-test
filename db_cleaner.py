@@ -1,6 +1,6 @@
 """
-🧹 db_cleaner.py v1.1 - Corrección de BD (Estrategias A + B)
-=============================================================
+🧹 db_cleaner.py v2.0 - Corrección de BD (Estrategias A + B + C)
+=================================================================
 
 ESTRATEGIA A: Validación año → modelo (con tolerancia ±2)
   - Holgura de ±2 años antes de cambiar modelo
@@ -10,11 +10,20 @@ ESTRATEGIA A: Validación año → modelo (con tolerancia ±2)
 ESTRATEGIA B: Mapeo de códigos → nombre de catálogo
   - c200 → clase c, 320i → serie 3, gla200 → clase gla
 
+ESTRATEGIA C: Re-matching de versiones (NUEVO v2.0)
+  - Seleccionar registros norm_status = 'partial_match'
+  - Tomar version_raw (nuevo campo) o reconstruir desde datos existentes
+  - Pasar por el normalizer mejorado con matching por componentes
+  - Si matchea → actualizar version, subir norm_status a full_match
+  - Verificación de coherencia versión↔modelo
+
 USO:
   python db_cleaner.py                      # Ejecutar corrección
   python db_cleaner.py --dry-run            # Simular sin cambios
   python db_cleaner.py --db otra.db         # BD alternativa
   python db_cleaner.py --verbose            # Más logs
+  python db_cleaner.py --skip-c             # Saltar Estrategia C
+  python db_cleaner.py --only-c             # Solo Estrategia C
 """
 
 import sqlite3
@@ -25,7 +34,7 @@ import sys
 import os
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import Counter
 
@@ -48,11 +57,16 @@ BACKUP_SUFFIX = '_nofix'
 CHANGELOG_TABLE = 'normalization_changelog'
 
 # ── Tolerancia de año ──
-YEAR_TOLERANCE = 2          # ±2 años antes de cambiar modelo
-YEAR_GARBAGE_THRESHOLD = 10 # >10 años fuera = año basura
+YEAR_TOLERANCE = 2
+YEAR_GARBAGE_THRESHOLD = 10
 CURRENT_YEAR = datetime.now().year
 YEAR_MAX_VALID = CURRENT_YEAR + 1
 YEAR_MIN_VALID = 1940
+
+# ── Estrategia C ──
+STRATEGY_C_BATCH_SIZE = 500
+STRATEGY_C_MIN_CONFIDENCE = 50
+
 
 # ═══════════════════════════════════════════════════════════════
 # 📊 ESTADÍSTICAS
@@ -75,8 +89,22 @@ class CleanerStats:
     code_issues_found: int = 0
     code_fixes_applied: int = 0
 
+    # Estrategia C (NUEVO)
+    strategy_c_candidates: int = 0
+    strategy_c_rematched: int = 0
+    strategy_c_upgraded: int = 0
+    strategy_c_confidence_lowered: int = 0
+    strategy_c_skipped: int = 0
+
     # Alias
     marca_alias_fixed: int = 0
+
+    # Extracción de metadata (NUEVO)
+    metadata_extracted: int = 0
+    gnc_detected: int = 0
+    es_0km_detected: int = 0
+    puertas_extracted: int = 0
+    traccion_extracted: int = 0
 
     # General
     total_fixes: int = 0
@@ -96,6 +124,15 @@ class CleanerStats:
             f"    - Sin sugerencia: {self.year_no_suggestion}\n"
             f"  Estrategia B (código→nombre): "
             f"{self.code_fixes_applied}/{self.code_issues_found}\n"
+            f"  Estrategia C (re-match versiones):\n"
+            f"    - Candidatos: {self.strategy_c_candidates}\n"
+            f"    - Re-matcheados: {self.strategy_c_rematched}\n"
+            f"    - Subidos a full_match: {self.strategy_c_upgraded}\n"
+            f"    - Confidence bajado: {self.strategy_c_confidence_lowered}\n"
+            f"    - Saltados: {self.strategy_c_skipped}\n"
+            f"  Metadata extraída: {self.metadata_extracted}\n"
+            f"    - GNC: {self.gnc_detected} | 0km: {self.es_0km_detected}\n"
+            f"    - Puertas: {self.puertas_extracted} | Tracción: {self.traccion_extracted}\n"
             f"  Alias de marca: {self.marca_alias_fixed}\n"
             f"  Total fixes: {self.total_fixes} | "
             f"Errores: {self.errors}"
@@ -103,7 +140,6 @@ class CleanerStats:
 
 
 STATS = CleanerStats()
-
 logger = logging.getLogger(__name__)
 
 
@@ -144,12 +180,13 @@ def setup_changelog(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_cl_vehicle
             ON {CHANGELOG_TABLE}(vehicle_id);
+        CREATE INDEX IF NOT EXISTS idx_cl_estrategia
+            ON {CHANGELOG_TABLE}(estrategia);
     """)
     conn.commit()
 
 
-def log_change(conn, vid, campo, old, new, estrategia, razon,
-               confidence=0):
+def log_change(conn, vid, campo, old, new, estrategia, razon, confidence=0):
     conn.execute(f"""
         INSERT INTO {CHANGELOG_TABLE}
         (vehicle_id, campo, valor_anterior, valor_nuevo,
@@ -167,37 +204,83 @@ def normalize_key(text):
     return text.lower().strip()
 
 
+def ensure_new_columns(conn):
+    """Agrega columnas nuevas si no existen (migración segura)."""
+    cursor = conn.execute("PRAGMA table_info(vehicles)")
+    existing = {row[1] for row in cursor.fetchall()}
+
+    new_columns = {
+        'puertas': 'INTEGER',
+        'traccion': 'TEXT',
+        'tiene_gnc': 'INTEGER DEFAULT 0',
+        'es_0km': 'INTEGER DEFAULT 0',
+        'version_raw': 'TEXT',
+        'descripcion': 'TEXT',
+        'norm_confidence': 'INTEGER DEFAULT 0',
+    }
+
+    added = []
+    for col, col_type in new_columns.items():
+        if col not in existing:
+            try:
+                conn.execute(
+                    f"ALTER TABLE vehicles ADD COLUMN {col} {col_type}"
+                )
+                added.append(col)
+            except sqlite3.OperationalError:
+                pass
+
+    if added:
+        conn.commit()
+        logger.info(f"📋 Columnas agregadas: {', '.join(added)}")
+    else:
+        logger.info("📋 Schema OK (todas las columnas existen)")
+
+
 def read_all_vehicles(conn):
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
-        SELECT id, url, marca, modelo, version, año,
-               kilometros, norm_status, activo
-        FROM vehicles ORDER BY id
+        SELECT id, url, marca, modelo, version, año, kilometros,
+               norm_status, activo, version_raw, descripcion,
+               puertas, traccion, tiene_gnc, es_0km,
+               norm_confidence
+        FROM vehicles
+        ORDER BY id
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def read_partial_match_vehicles(conn):
+    """Lee vehículos con partial_match para Estrategia C."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT id, url, marca, modelo, version, año, kilometros,
+               norm_status, activo, version_raw, descripcion,
+               puertas, traccion, tiene_gnc, es_0km,
+               norm_confidence, transmision, combustible
+        FROM vehicles
+        WHERE norm_status = 'partial_match'
+          AND marca IS NOT NULL
+          AND modelo IS NOT NULL
+        ORDER BY id
     """).fetchall()
     return [dict(r) for r in rows]
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📅 AÑO BASURA (NUEVO v1.1)
+# 📅 AÑO BASURA
 # ═══════════════════════════════════════════════════════════════
 
 def is_year_garbage(año, km=None):
-    """
-    Detecta año basura SIN necesidad de catálogo.
-    Para validación rápida antes de buscar en catálogo.
-    """
     if not año:
         return False, None
 
-    # Futuro
     if año > YEAR_MAX_VALID:
         return True, f"Año {año} es futuro (máx: {YEAR_MAX_VALID})"
 
-    # Muy antiguo
     if año < YEAR_MIN_VALID:
         return True, f"Año {año} < {YEAR_MIN_VALID}"
 
-    # Km altos + año actual/futuro
     if km and km > 50000 and año >= CURRENT_YEAR:
         return True, (
             f"Año {año} con {km:,} km es imposible"
@@ -207,10 +290,6 @@ def is_year_garbage(año, km=None):
 
 
 def is_year_garbage_for_model(año, model_range):
-    """
-    Detecta año basura respecto al rango del modelo.
-    Retorna (is_garbage, distance, reason).
-    """
     if not año or not model_range:
         return False, 0, None
 
@@ -239,25 +318,15 @@ def is_year_garbage_for_model(año, model_range):
 # ═══════════════════════════════════════════════════════════════
 
 def check_year_range(catalog, marca, modelo, año, km=None):
-    """
-    Verifica año vs rango del modelo CON TOLERANCIA.
-
-    Returns None si OK, o Dict con resultado:
-      - action: 'keep' | 'correct' | 'garbage' | 'no_suggestion'
-      - suggestion: modelo sugerido (si action='correct')
-      - reason: explicación
-    """
     if not año or not marca or not modelo:
         return None
 
     marca_resolved = catalog.resolve_brand(marca)
-
     if not catalog.has_brand(marca_resolved):
         return None
     if not catalog.has_model(marca_resolved, modelo):
         return None
 
-    # ── Año basura absoluto (futuro, etc.) ──
     garbage, reason = is_year_garbage(año, km)
     if garbage:
         return {
@@ -266,7 +335,6 @@ def check_year_range(catalog, marca, modelo, año, km=None):
             'reason': reason,
         }
 
-    # ── Verificar rango del modelo ──
     yr = catalog.get_year_range(marca_resolved, modelo)
     if not yr:
         return None
@@ -274,11 +342,9 @@ def check_year_range(catalog, marca, modelo, año, km=None):
     desde = yr.get('desde', 0)
     hasta = yr.get('hasta', 9999)
 
-    # Dentro del rango real → OK
     if desde <= año <= hasta:
         return None
 
-    # Dentro de la tolerancia → KEEP (no tocar)
     desde_tol = desde - YEAR_TOLERANCE
     hasta_tol = hasta + YEAR_TOLERANCE
 
@@ -292,7 +358,6 @@ def check_year_range(catalog, marca, modelo, año, km=None):
             ),
         }
 
-    # ── Verificar si es basura para este modelo ──
     garbage_model, distance, reason = is_year_garbage_for_model(año, yr)
     if garbage_model:
         return {
@@ -300,10 +365,6 @@ def check_year_range(catalog, marca, modelo, año, km=None):
             'suggestion': None,
             'reason': reason,
         }
-
-    # ── Buscar sucesor/predecesor ──
-    # Caminar la cadena buscando modelo donde el año
-    # caiga DENTRO del rango real (sin tolerancia)
 
     if año > hasta:
         suggestion = _walk_successors(
@@ -380,10 +441,6 @@ def _walk_predecessors(catalog, marca, modelo, año, max_depth=5):
 # ═══════════════════════════════════════════════════════════════
 
 def check_code_mapping(catalog, marca, modelo):
-    """
-    Si el modelo es un código → mapear a nombre de catálogo.
-    Ejemplo: "c200" → "clase c"
-    """
     if not marca or not modelo:
         return None
 
@@ -399,7 +456,6 @@ def check_code_mapping(catalog, marca, modelo):
     if not code_mappings:
         return None
 
-    # Match exacto del modelo como código
     if modelo_norm in code_mappings:
         mapped = code_mappings[modelo_norm]
         if isinstance(mapped, dict):
@@ -419,26 +475,20 @@ def check_code_mapping(catalog, marca, modelo):
                 ),
             }
 
-    # Extraer prefijo
     prefixes = []
-
-    # letras+números: c200, gla250
     m = re.match(r'^([a-z]+)[\s\-]?(\d+)', modelo_norm)
     if m:
         prefixes.append(m.group(1))
         prefixes.append(f"{m.group(1)}{m.group(2)}")
 
-    # número+letra: 320i
     m = re.match(r'^(\d)(\d{2})[a-z]?$', modelo_norm)
     if m:
         prefixes.append(m.group(1))
 
-    # x1, m3, z4, rs3, etc
     m = re.match(r'^(x\d|m\d|z\d|i\d|rs\d|ix\d?)', modelo_norm)
     if m:
         prefixes.append(m.group(1))
 
-    # a1, q5, s3, tt
     m = re.match(r'^([aqst]{1,2}\d?)', modelo_norm)
     if m:
         prefixes.append(m.group(1))
@@ -468,7 +518,407 @@ def check_code_mapping(catalog, marca, modelo):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔄 PROCESO PRINCIPAL
+# 🅲️ ESTRATEGIA C: RE-MATCHING DE VERSIONES (NUEVO v2.0)
+# ═══════════════════════════════════════════════════════════════
+
+def extract_metadata_from_text(text: str) -> Dict[str, Any]:
+    """Extrae puertas, tracción, GNC, 0km de texto libre."""
+    result = {
+        'puertas': None,
+        'traccion': None,
+        'tiene_gnc': None,
+        'es_0km': None,
+    }
+    if not text:
+        return result
+
+    t = text.lower()
+
+    # Puertas
+    m = re.search(r'\b([345])\s*[pP](?:uertas?)?\b', text, re.IGNORECASE)
+    if m:
+        result['puertas'] = int(m.group(1))
+
+    # Tracción
+    m = re.search(r'\b(4x[24])\b|(?i)\b(AWD|FWD|RWD)\b', text)
+    if m:
+        result['traccion'] = (m.group(1) or m.group(2)).lower()
+
+    # GNC
+    if re.search(r'\bGNC\b|\bgas\s*natural\b|\bc[/\s]?GNC\b|\bcon\s+GNC\b',
+                 text, re.IGNORECASE):
+        result['tiene_gnc'] = True
+
+    # 0km
+    if re.search(r'\b0\s*km\b|\bcero\s*km\b|\bokm\b', t):
+        result['es_0km'] = True
+
+    return result
+
+
+def reconstruct_version_input(v: Dict) -> str:
+    """Reconstruye un texto de versión a partir de datos existentes."""
+    parts = []
+
+    # Usar version_raw si existe
+    if v.get('version_raw'):
+        return v['version_raw']
+
+    # Reconstruir desde version + datos
+    if v.get('version'):
+        parts.append(v['version'])
+
+    if v.get('transmision'):
+        trans = v['transmision'].lower()
+        if trans not in (p.lower() for p in parts):
+            parts.append(trans)
+
+    return ' '.join(parts)
+
+
+def strategy_c_rematch(conn, catalog, dry_run=False):
+    """
+    Estrategia C: Re-matching de versiones para partial_match.
+
+    Para cada registro con partial_match (tiene marca+modelo pero no versión):
+    1. Tomar version_raw o reconstruir desde datos existentes
+    2. Pasar por el normalizer con matching por componentes
+    3. Si matchea → actualizar version, subir a full_match
+    4. Verificar coherencia versión↔modelo
+    """
+    logger.info("\n🅲️  ESTRATEGIA C: Re-matching de versiones")
+    logger.info("─" * 50)
+
+    vehicles = read_partial_match_vehicles(conn)
+    STATS.strategy_c_candidates = len(vehicles)
+
+    if not vehicles:
+        logger.info("   Sin candidatos para re-matching")
+        return
+
+    logger.info(f"   Candidatos: {len(vehicles)}")
+
+    upgraded = 0
+    rematched = 0
+    confidence_lowered = 0
+    skipped = 0
+    examples = []
+
+    for i in range(0, len(vehicles), STRATEGY_C_BATCH_SIZE):
+        batch = vehicles[i:i + STRATEGY_C_BATCH_SIZE]
+
+        for v in batch:
+            vid = v['id']
+            marca = normalize_key(v.get('marca') or '')
+            modelo = normalize_key(v.get('modelo') or '')
+
+            if not marca or not modelo:
+                skipped += 1
+                continue
+
+            marca_resolved = catalog.resolve_brand(marca)
+            if not catalog.has_model(marca_resolved, modelo):
+                skipped += 1
+                continue
+
+            # Reconstruir input de versión
+            version_input = reconstruct_version_input(v)
+            if not version_input or len(version_input.strip()) < 2:
+                skipped += 1
+                continue
+
+            # Construir texto de búsqueda amplio
+            desc = v.get('descripcion') or ''
+            search_parts = [version_input]
+            if desc:
+                search_parts.append(desc[:500])
+            search_text = ' '.join(search_parts)
+
+            try:
+                # Usar normalize_vehicle para re-procesar
+                norm = nv2.normalize_vehicle(
+                    titulo='',
+                    descripcion=desc,
+                    marca_raw=marca_resolved,
+                    modelo_raw=modelo,
+                    version_raw=version_input,
+                    año_raw=v.get('año'),
+                    km_raw=v.get('kilometros'),
+                )
+
+                new_version = norm.get('version')
+                new_confidence = norm.get('confidence', 0)
+                version_method = norm.get('version_method')
+                extracted = norm.get('extracted_data', {})
+
+                if new_version:
+                    # Verificar coherencia: la versión debe pertenecer
+                    # al modelo según catálogo
+                    valid_versions = catalog.get_versions(
+                        marca_resolved, modelo
+                    )
+                    version_in_catalog = (
+                        normalize_key(new_version) in
+                        [normalize_key(vv) for vv in valid_versions]
+                    ) if valid_versions else False
+
+                    if version_in_catalog:
+                        rematched += 1
+
+                        if not dry_run:
+                            updates = {
+                                'version': new_version,
+                                'norm_status': 'full_match',
+                                'norm_confidence': new_confidence,
+                            }
+
+                            # Extraer metadata adicional
+                            meta_from_text = extract_metadata_from_text(
+                                f"{version_input} {desc}"
+                            )
+
+                            if extracted.get('puertas') or meta_from_text.get('puertas'):
+                                updates['puertas'] = (
+                                    extracted.get('puertas') or
+                                    meta_from_text.get('puertas')
+                                )
+                                STATS.puertas_extracted += 1
+
+                            if extracted.get('traccion') or meta_from_text.get('traccion'):
+                                updates['traccion'] = (
+                                    extracted.get('traccion') or
+                                    meta_from_text.get('traccion')
+                                )
+                                STATS.traccion_extracted += 1
+
+                            if extracted.get('tiene_gnc') or meta_from_text.get('tiene_gnc'):
+                                updates['tiene_gnc'] = 1
+                                STATS.gnc_detected += 1
+
+                            if extracted.get('es_0km') or meta_from_text.get('es_0km'):
+                                updates['es_0km'] = 1
+                                STATS.es_0km_detected += 1
+
+                            # Aplicar updates
+                            sets = ', '.join(
+                                f"{k} = ?" for k in updates
+                            )
+                            vals = list(updates.values()) + [vid]
+                            conn.execute(
+                                f"UPDATE vehicles SET {sets} WHERE id = ?",
+                                vals
+                            )
+
+                            log_change(
+                                conn, vid, 'version',
+                                v.get('version'), new_version,
+                                'C_version_rematch',
+                                f"Re-match por {version_method}: "
+                                f"'{version_input}' → '{new_version}' "
+                                f"(conf: {new_confidence})",
+                                new_confidence
+                            )
+
+                            log_change(
+                                conn, vid, 'norm_status',
+                                'partial_match', 'full_match',
+                                'C_version_rematch',
+                                f"Upgrade: versión encontrada por {version_method}",
+                                new_confidence
+                            )
+
+                        upgraded += 1
+                        STATS.total_fixes += 1
+
+                        if len(examples) < 15:
+                            examples.append({
+                                'id': vid,
+                                'marca': marca_resolved,
+                                'modelo': modelo,
+                                'input': version_input[:60],
+                                'version': new_version,
+                                'method': version_method,
+                                'confidence': new_confidence,
+                            })
+
+                    else:
+                        # Versión encontrada pero no pertenece al modelo
+                        if new_confidence > STRATEGY_C_MIN_CONFIDENCE:
+                            # Bajar confidence
+                            if not dry_run:
+                                new_conf = max(
+                                    10,
+                                    new_confidence - 20
+                                )
+                                conn.execute(
+                                    "UPDATE vehicles SET "
+                                    "norm_confidence = ? WHERE id = ?",
+                                    (new_conf, vid)
+                                )
+                                log_change(
+                                    conn, vid, 'norm_confidence',
+                                    str(new_confidence),
+                                    str(new_conf),
+                                    'C_coherence_check',
+                                    f"Versión '{new_version}' no pertenece "
+                                    f"a '{modelo}' según catálogo",
+                                    new_conf
+                                )
+                            confidence_lowered += 1
+                else:
+                    # No encontró versión pero extraer metadata
+                    meta = extract_metadata_from_text(
+                        f"{version_input} {desc}"
+                    )
+                    meta_updates = {}
+
+                    if meta.get('puertas') and not v.get('puertas'):
+                        meta_updates['puertas'] = meta['puertas']
+                        STATS.puertas_extracted += 1
+
+                    if meta.get('traccion') and not v.get('traccion'):
+                        meta_updates['traccion'] = meta['traccion']
+                        STATS.traccion_extracted += 1
+
+                    if meta.get('tiene_gnc') and not v.get('tiene_gnc'):
+                        meta_updates['tiene_gnc'] = 1
+                        STATS.gnc_detected += 1
+
+                    km = v.get('kilometros')
+                    if (km is not None and km == 0 and
+                            meta.get('es_0km') and not v.get('es_0km')):
+                        meta_updates['es_0km'] = 1
+                        STATS.es_0km_detected += 1
+
+                    if meta_updates and not dry_run:
+                        sets = ', '.join(
+                            f"{k} = ?" for k in meta_updates
+                        )
+                        vals = list(meta_updates.values()) + [vid]
+                        conn.execute(
+                            f"UPDATE vehicles SET {sets} WHERE id = ?",
+                            vals
+                        )
+                        STATS.metadata_extracted += 1
+
+                    skipped += 1
+
+            except Exception as e:
+                STATS.errors += 1
+                logger.debug(f"  Error re-matching {vid}: {e}")
+                skipped += 1
+
+        if not dry_run:
+            conn.commit()
+
+        processed = min(i + STRATEGY_C_BATCH_SIZE, len(vehicles))
+        if processed % 1000 == 0 or processed == len(vehicles):
+            logger.info(
+                f"   {processed}/{len(vehicles)} | "
+                f"Upgraded: {upgraded} | Rematched: {rematched}"
+            )
+
+    STATS.strategy_c_rematched = rematched
+    STATS.strategy_c_upgraded = upgraded
+    STATS.strategy_c_confidence_lowered = confidence_lowered
+    STATS.strategy_c_skipped = skipped
+
+    logger.info(f"\n   📊 Estrategia C completada:")
+    logger.info(f"      Candidatos: {len(vehicles)}")
+    logger.info(f"      Re-matcheados: {rematched}")
+    logger.info(f"      Subidos a full_match: {upgraded}")
+    logger.info(f"      Confidence bajado: {confidence_lowered}")
+    logger.info(f"      Saltados: {skipped}")
+    logger.info(f"      Metadata extraída: {STATS.metadata_extracted}")
+
+    if examples:
+        logger.info(f"\n   🅲️ Ejemplos de re-match:")
+        for ex in examples[:10]:
+            logger.info(
+                f"      [{ex['id']}] {ex['marca']} {ex['modelo']}: "
+                f"'{ex['input']}' → '{ex['version']}' "
+                f"({ex['method']}, conf:{ex['confidence']})"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔍 EXTRACCIÓN DE METADATA EN LOTE (para datos existentes)
+# ═══════════════════════════════════════════════════════════════
+
+def extract_metadata_batch(conn, dry_run=False):
+    """
+    Extrae metadata (puertas, tracción, GNC, 0km) de registros
+    existentes que tengan version_raw o descripcion pero no
+    tienen esos campos completados.
+    """
+    logger.info("\n🔍 Extracción de metadata en lote")
+    logger.info("─" * 50)
+
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT id, version_raw, descripcion, kilometros,
+               puertas, traccion, tiene_gnc, es_0km
+        FROM vehicles
+        WHERE (version_raw IS NOT NULL OR descripcion IS NOT NULL)
+          AND (puertas IS NULL AND traccion IS NULL
+               AND tiene_gnc = 0 AND es_0km = 0)
+    """).fetchall()
+
+    if not rows:
+        logger.info("   Sin registros pendientes de extracción")
+        return
+
+    logger.info(f"   Registros a procesar: {len(rows)}")
+    updated = 0
+
+    for row in rows:
+        row = dict(row)
+        text = ' '.join(filter(None, [
+            row.get('version_raw', ''),
+            row.get('descripcion', '')
+        ]))
+
+        if not text.strip():
+            continue
+
+        meta = extract_metadata_from_text(text)
+        updates = {}
+
+        if meta.get('puertas') and not row.get('puertas'):
+            updates['puertas'] = meta['puertas']
+            STATS.puertas_extracted += 1
+
+        if meta.get('traccion') and not row.get('traccion'):
+            updates['traccion'] = meta['traccion']
+            STATS.traccion_extracted += 1
+
+        if meta.get('tiene_gnc') and not row.get('tiene_gnc'):
+            updates['tiene_gnc'] = 1
+            STATS.gnc_detected += 1
+
+        km = row.get('kilometros')
+        if (km is not None and km == 0 and
+                meta.get('es_0km') and not row.get('es_0km')):
+            updates['es_0km'] = 1
+            STATS.es_0km_detected += 1
+
+        if updates and not dry_run:
+            sets = ', '.join(f"{k} = ?" for k in updates)
+            vals = list(updates.values()) + [row['id']]
+            conn.execute(
+                f"UPDATE vehicles SET {sets} WHERE id = ?", vals
+            )
+            updated += 1
+
+    if not dry_run:
+        conn.commit()
+
+    logger.info(f"   Actualizados: {updated}")
+    STATS.metadata_extracted += updated
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔄 PROCESO PRINCIPAL (Estrategias A + B)
 # ═══════════════════════════════════════════════════════════════
 
 def process_vehicle(v, catalog, conn, dry_run=False):
@@ -487,7 +937,9 @@ def process_vehicle(v, catalog, conn, dry_run=False):
     marca_resolved = catalog.resolve_brand(marca)
     if marca_resolved != marca and catalog.has_brand(marca_resolved):
         changes.append({
-            'campo': 'marca', 'old': marca, 'new': marca_resolved,
+            'campo': 'marca',
+            'old': marca,
+            'new': marca_resolved,
             'estrategia': 'alias_marca',
             'reason': f"Alias: '{marca}' → '{marca_resolved}'",
             'confidence': 95,
@@ -506,7 +958,9 @@ def process_vehicle(v, catalog, conn, dry_run=False):
             año_is_garbage = True
             STATS.year_garbage_detected += 1
             changes.append({
-                'campo': 'año', 'old': año, 'new': None,
+                'campo': 'año',
+                'old': año,
+                'new': None,
                 'estrategia': 'year_garbage',
                 'reason': f"Año basura: {reason}",
                 'confidence': 90,
@@ -520,7 +974,9 @@ def process_vehicle(v, catalog, conn, dry_run=False):
         STATS.code_issues_found += 1
         mapped = code_result['mapped_model']
         changes.append({
-            'campo': 'modelo', 'old': modelo, 'new': mapped,
+            'campo': 'modelo',
+            'old': modelo,
+            'new': mapped,
             'estrategia': 'B_code_mapping',
             'reason': code_result['reason'],
             'confidence': 90,
@@ -541,7 +997,6 @@ def process_vehicle(v, catalog, conn, dry_run=False):
                 logger.debug(
                     f"  ✅ [{vid}] {year_result['reason']}"
                 )
-
             elif action == 'correct':
                 STATS.year_issues_found += 1
                 suggestion = year_result['suggestion']
@@ -554,17 +1009,17 @@ def process_vehicle(v, catalog, conn, dry_run=False):
                     'confidence': 85,
                 })
                 STATS.year_fixes_applied += 1
-
             elif action == 'garbage':
                 STATS.year_garbage_detected += 1
                 changes.append({
-                    'campo': 'año', 'old': año, 'new': None,
+                    'campo': 'año',
+                    'old': año,
+                    'new': None,
                     'estrategia': 'year_garbage_model',
                     'reason': year_result['reason'],
                     'confidence': 85,
                 })
                 STATS.year_nullified += 1
-
             elif action == 'no_suggestion':
                 STATS.year_issues_found += 1
                 STATS.year_no_suggestion += 1
@@ -581,7 +1036,8 @@ def process_vehicle(v, catalog, conn, dry_run=False):
             log_change(
                 conn, vid, campo,
                 change['old'], change['new'],
-                change['estrategia'], change['reason'],
+                change['estrategia'],
+                change['reason'],
                 change['confidence']
             )
 
@@ -616,18 +1072,22 @@ def process_vehicle(v, catalog, conn, dry_run=False):
 # ═══════════════════════════════════════════════════════════════
 
 def run_cleaner(db_path, dry_run=False,
-                dicts_path='config/normalizer_dicts.json'):
+                dicts_path='config/normalizer_dicts.json',
+                skip_c=False, only_c=False):
     global STATS
     STATS = CleanerStats()
 
     logger.info("🧹 " + "=" * 58)
-    logger.info("🧹 DB CLEANER v1.1 — Estrategias A + B")
+    logger.info("🧹 DB CLEANER v2.0 — Estrategias A + B + C")
     logger.info("🧹 " + "=" * 58)
     logger.info(
         f"   Tolerancia de año: ±{YEAR_TOLERANCE} | "
         f"Umbral basura: ±{YEAR_GARBAGE_THRESHOLD}"
     )
-
+    if skip_c:
+        logger.info("   ⏭️ Estrategia C desactivada")
+    if only_c:
+        logger.info("   🎯 Solo Estrategia C")
     if dry_run:
         logger.info("   ⚡ MODO DRY-RUN")
 
@@ -646,6 +1106,7 @@ def run_cleaner(db_path, dry_run=False,
     if not loaded:
         logger.error(f"❌ Catálogo no cargado: {dicts_path}")
         sys.exit(1)
+
     catalog = nv2.get_catalog()
     logger.info("✅ Catálogo cargado")
 
@@ -655,47 +1116,66 @@ def run_cleaner(db_path, dry_run=False,
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+
+    # Migrar schema
+    ensure_new_columns(conn)
     setup_changelog(conn)
 
-    vehicles = read_all_vehicles(conn)
-    STATS.total_vehicles = len(vehicles)
-    logger.info(f"📊 Vehículos: {len(vehicles)}")
+    # ── Estrategias A + B ──
+    if not only_c:
+        vehicles = read_all_vehicles(conn)
+        STATS.total_vehicles = len(vehicles)
+        logger.info(f"📊 Vehículos: {len(vehicles)}")
 
-    examples_a = []
-    examples_b = []
-    examples_garbage = []
-    examples_tolerance = []
+        examples_a = []
+        examples_b = []
+        examples_garbage = []
 
-    batch_size = 500
-    for i in range(0, len(vehicles), batch_size):
-        batch = vehicles[i:i + batch_size]
-        for v in batch:
-            STATS.analyzed += 1
-            try:
-                changes = process_vehicle(v, catalog, conn, dry_run)
-                for c in changes:
-                    ex = {'id': v['id'], 'año': v.get('año'), **c}
-                    if (c['estrategia'] == 'A_year_validation'
-                            and len(examples_a) < 10):
-                        examples_a.append(ex)
-                    elif (c['estrategia'] == 'B_code_mapping'
-                            and len(examples_b) < 10):
-                        examples_b.append(ex)
-                    elif ('garbage' in c['estrategia']
-                            and len(examples_garbage) < 10):
-                        examples_garbage.append(ex)
-            except Exception as e:
-                STATS.errors += 1
-                logger.debug(f"Error {v['id']}: {e}")
+        batch_size = 500
+        for i in range(0, len(vehicles), batch_size):
+            batch = vehicles[i:i + batch_size]
+            for v in batch:
+                STATS.analyzed += 1
+                try:
+                    changes = process_vehicle(
+                        v, catalog, conn, dry_run
+                    )
+                    for c in changes:
+                        ex = {
+                            'id': v['id'],
+                            'año': v.get('año'),
+                            **c
+                        }
+                        if (c['estrategia'] == 'A_year_validation'
+                                and len(examples_a) < 10):
+                            examples_a.append(ex)
+                        elif (c['estrategia'] == 'B_code_mapping'
+                              and len(examples_b) < 10):
+                            examples_b.append(ex)
+                        elif ('garbage' in c['estrategia']
+                              and len(examples_garbage) < 10):
+                            examples_garbage.append(ex)
+                except Exception as e:
+                    STATS.errors += 1
+                    logger.debug(f"Error {v['id']}: {e}")
+
+            if not dry_run:
+                conn.commit()
+            processed = min(i + batch_size, len(vehicles))
+            logger.info(
+                f"   {processed}/{len(vehicles)} | "
+                f"Fixes: {STATS.total_fixes}"
+            )
 
         if not dry_run:
             conn.commit()
 
-        processed = min(i + batch_size, len(vehicles))
-        logger.info(
-            f"   {processed}/{len(vehicles)} | "
-            f"Fixes: {STATS.total_fixes}"
-        )
+    # ── Estrategia C ──
+    if not skip_c:
+        strategy_c_rematch(conn, catalog, dry_run)
+
+    # ── Extracción de metadata en lote ──
+    extract_metadata_batch(conn, dry_run)
 
     if not dry_run:
         conn.commit()
@@ -706,29 +1186,30 @@ def run_cleaner(db_path, dry_run=False,
     logger.info(f"{'═' * 60}")
     logger.info(f"\n{STATS.summary()}")
 
-    if examples_garbage:
-        logger.info(f"\n🗑️ Ejemplos - Año basura:")
-        for ex in examples_garbage[:5]:
-            logger.info(
-                f"   [{ex['id']}] año {ex.get('año')}: "
-                f"{ex['reason']}"
-            )
-
-    if examples_b:
-        logger.info(f"\n🅱️ Ejemplos - Código → catálogo:")
-        for ex in examples_b[:5]:
-            logger.info(
-                f"   [{ex['id']}] {ex['old']} → {ex['new']}"
-            )
-
-    if examples_a:
-        logger.info(f"\n🅰️ Ejemplos - Corrección por año:")
-        for ex in examples_a[:5]:
-            logger.info(
-                f"   [{ex['id']}] año {ex.get('año')}: "
-                f"{ex['old']} → {ex['new']}"
-            )
-            logger.info(f"      ↳ {ex['reason']}")
+    if not only_c:
+        if examples_garbage:
+            logger.info(f"\n🗑️ Ejemplos - Año basura:")
+            for ex in examples_garbage[:5]:
+                logger.info(
+                    f"   [{ex['id']}] año {ex.get('año')}: "
+                    f"{ex['reason']}"
+                )
+        if examples_b:
+            logger.info(f"\n🅱️ Ejemplos - Código → catálogo:")
+            for ex in examples_b[:5]:
+                logger.info(
+                    f"   [{ex['id']}] {ex['old']} → {ex['new']}"
+                )
+        if examples_a:
+            logger.info(f"\n🅰️ Ejemplos - Corrección por año:")
+            for ex in examples_a[:5]:
+                logger.info(
+                    f"   [{ex['id']}] año {ex.get('año')}: "
+                    f"{ex['old']} → {ex['new']}"
+                )
+                logger.info(
+                    f"      ↳ {ex['reason']}"
+                )
 
     # Estado final
     if not dry_run:
@@ -740,7 +1221,8 @@ def run_cleaner(db_path, dry_run=False,
 
         rows = conn.execute("""
             SELECT norm_status, COUNT(*) as c
-            FROM vehicles GROUP BY norm_status
+            FROM vehicles
+            GROUP BY norm_status
             ORDER BY c DESC
         """).fetchall()
         for row in rows:
@@ -753,6 +1235,19 @@ def run_cleaner(db_path, dry_run=False,
         ).fetchone()['c']
         logger.info(f"\n📝 Changelog: {cl} entradas")
 
+        # Estadísticas Estrategia C
+        try:
+            c_entries = conn.execute(
+                f"SELECT COUNT(*) as c FROM {CHANGELOG_TABLE} "
+                f"WHERE estrategia LIKE 'C_%'"
+            ).fetchone()['c']
+            if c_entries:
+                logger.info(
+                    f"   └─ Estrategia C: {c_entries} cambios"
+                )
+        except:
+            pass
+
     conn.close()
 
     if dry_run:
@@ -764,12 +1259,13 @@ def run_cleaner(db_path, dry_run=False,
     logger.info(f"\n{'═' * 60}")
     logger.info("✅ COMPLETADO")
     logger.info(f"{'═' * 60}")
+
     return STATS
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='🧹 Limpieza de BD v1.1 — Estrategias A + B'
+        description='🧹 Limpieza de BD v2.0 — Estrategias A + B + C'
     )
     parser.add_argument(
         '--db', default=DEFAULT_DB,
@@ -780,12 +1276,21 @@ def parse_args():
         help='Simular sin aplicar'
     )
     parser.add_argument(
-        '--dicts-path', default='config/normalizer_dicts.json',
+        '--dicts-path',
+        default='config/normalizer_dicts.json',
         help='Ruta al JSON de diccionarios'
     )
     parser.add_argument(
         '-v', '--verbose', action='store_true',
         help='Más logs'
+    )
+    parser.add_argument(
+        '--skip-c', action='store_true',
+        help='Saltar Estrategia C (re-matching versiones)'
+    )
+    parser.add_argument(
+        '--only-c', action='store_true',
+        help='Ejecutar SOLO Estrategia C'
     )
     return parser.parse_args()
 
@@ -797,8 +1302,10 @@ def main():
         db_path=args.db,
         dry_run=args.dry_run,
         dicts_path=args.dicts_path,
+        skip_c=args.skip_c,
+        only_c=args.only_c,
     )
-    if stats.errors > stats.total_vehicles * 0.1:
+    if stats.errors > max(stats.total_vehicles * 0.1, 10):
         sys.exit(1)
     sys.exit(0)
 
