@@ -148,6 +148,9 @@ jobs:
           echo "✅ Copia creada: rosariogarage_nofix.db"
           ls -lh rosariogarage_nofix.db
 
+      - name: 🔬 Debug normalización Chevrolet
+        run: python diagnose_versions.py
+      
       # ──────────────────────────────────────────────
       # Ejecutar corrección
       # ──────────────────────────────────────────────
