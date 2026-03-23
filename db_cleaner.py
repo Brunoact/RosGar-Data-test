@@ -597,6 +597,17 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
 
     logger.info(f"   Candidatos: {len(vehicles)}")
 
+    # ═══ NUEVO: Palabras que NO son versiones reales ═══
+    JUNK_VERSION_INPUTS = {
+        'manual', 'automatico', 'automatica', 'automatic',
+        'mt', 'at', 'cvt', 'dsg', 'tiptronic',
+        'nafta', 'naftero', 'diesel', 'gasoil', 'gnc',
+        'gas', 'electrico', 'hibrido',
+        'full', 'semifull', 'base',
+        'particular', 'titular', 'unico',
+        'impecable', 'excelente', 'nuevo', 'nueva',
+    }
+
     upgraded = 0
     rematched = 0
     confidence_lowered = 0
@@ -628,6 +639,29 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                 skipped += 1
                 continue
 
+            # ═══ NUEVO: Filtrar inputs que no son versiones ═══
+            version_clean = version_input.strip().lower()
+            # Quitar marca del input para evaluar
+            if marca_resolved:
+                version_clean = version_clean.replace(
+                    marca_resolved, ''
+                ).strip()
+            # Quitar modelo del input
+            if modelo:
+                version_clean = version_clean.replace(
+                    modelo, ''
+                ).strip()
+
+            # Si después de limpiar queda solo basura, saltar
+            remaining_words = [
+                w for w in version_clean.split()
+                if w not in JUNK_VERSION_INPUTS
+                and len(w) >= 2
+            ]
+            if not remaining_words:
+                skipped += 1
+                continue
+
             # Construir texto de búsqueda amplio
             desc = v.get('descripcion') or ''
             search_parts = [version_input]
@@ -637,7 +671,6 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
 
             try:
                 # Pre-limpiar marca del version_input
-                # usando re.escape para caracteres especiales
                 version_for_norm = version_input
                 if marca_resolved:
                     try:
@@ -650,7 +683,6 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                             flags=re.IGNORECASE
                         ).strip()
                     except re.error:
-                        # Si falla el regex, limpiar manualmente
                         version_for_norm = (
                             version_for_norm
                             .replace(marca_resolved, '')
@@ -674,6 +706,14 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                 extracted = norm.get('extracted_data', {})
 
                 if new_version:
+                    # ═══ NUEVO: Verificar que la versión no sea
+                    # un match espurio (solo por transmisión) ═══
+                    if version_method == 'component_match':
+                        ver_score = norm.get('version_score', 0)
+                        if ver_score < 40:
+                            skipped += 1
+                            continue
+
                     # Verificar coherencia
                     valid_versions = catalog.get_versions(
                         marca_resolved, modelo
@@ -741,11 +781,11 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                                 STATS.es_0km_detected += 1
 
                             sets = ', '.join(
-                                f"{k} = ?"
-                                for k in updates
+                                f"{k} = ?" for k in updates
                             )
                             vals = (
-                                list(updates.values()) + [vid]
+                                list(updates.values())
+                                + [vid]
                             )
                             conn.execute(
                                 f"UPDATE vehicles "
@@ -764,9 +804,11 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                                 f"(conf: {new_confidence})",
                                 new_confidence
                             )
+
                             log_change(
                                 conn, vid, 'norm_status',
-                                'partial_match', 'full_match',
+                                'partial_match',
+                                'full_match',
                                 'C_version_rematch',
                                 f"Upgrade: versión encontrada "
                                 f"por {version_method}",
@@ -786,7 +828,6 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                                 'method': version_method,
                                 'confidence': new_confidence,
                             })
-
                     else:
                         # Versión no pertenece al modelo
                         if (new_confidence
@@ -814,7 +855,7 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                                 )
                             confidence_lowered += 1
                 else:
-                    # No encontró versión, igual extraer metadata
+                    # No encontró versión, extraer metadata
                     meta = extract_metadata_from_text(
                         f"{version_input} {desc}"
                     )
@@ -848,11 +889,11 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
 
                     if meta_updates and not dry_run:
                         sets = ', '.join(
-                            f"{k} = ?"
-                            for k in meta_updates
+                            f"{k} = ?" for k in meta_updates
                         )
                         vals = (
-                            list(meta_updates.values()) + [vid]
+                            list(meta_updates.values())
+                            + [vid]
                         )
                         conn.execute(
                             f"UPDATE vehicles "
@@ -864,7 +905,6 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                     skipped += 1
 
             except re.error as e:
-                # Error de regex: loguear con detalle y continuar
                 STATS.errors += 1
                 logger.debug(
                     f"  Regex error en {vid} "
@@ -916,7 +956,6 @@ def strategy_c_rematch(conn, catalog, dry_run=False):
                 f"'{ex['input']}' → '{ex['version']}' "
                 f"({ex['method']}, conf:{ex['confidence']})"
             )
-
 # ═══════════════════════════════════════════════════════════════
 # 🔍 EXTRACCIÓN DE METADATA EN LOTE (para datos existentes)
 # ═══════════════════════════════════════════════════════════════
