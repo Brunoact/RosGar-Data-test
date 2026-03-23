@@ -1,0 +1,367 @@
+# .github/workflows/fix-db-versions.yml
+name: 🔧 DB Fix & Diagnóstico
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Acción a ejecutar'
+        required: true
+        type: choice
+        options:
+          - diagnose
+          - fix-dry-run
+          - fix-apply
+          - clean-db
+          - clean-dry-run
+          - full-pipeline
+        default: diagnose
+
+      marca:
+        description: 'Marca a analizar (vacío = todas)'
+        required: false
+        type: string
+        default: 'chevrolet'
+
+      verbose:
+        description: 'Modo verbose (más logs)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  fix-database:
+    name: 🔧 ${{ inputs.action }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ──
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      # ── Python ──
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 📦 Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Descargar BD maestra ──
+      - name: 📥 Descargar BD maestra
+        id: download-db
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          name: rosariogarage-master-db
+          workflow: scrape.yml
+          workflow_conclusion: success
+          if_no_artifact_found: warn
+
+      - name: 📋 Verificar BD
+        run: |
+          if [ -f "rosariogarage.db" ]; then
+            SIZE=$(du -h rosariogarage.db | cut -f1)
+            TOTAL=$(sqlite3 rosariogarage.db "SELECT COUNT(*) FROM vehicles;")
+            ACTIVOS=$(sqlite3 rosariogarage.db "SELECT COUNT(*) FROM vehicles WHERE activo=1;")
+            echo "✅ BD encontrada: $SIZE"
+            echo "   Total: $TOTAL | Activos: $ACTIVOS"
+          else
+            echo "❌ BD no encontrada"
+            echo "   Verificar que el scraper haya corrido al menos una vez"
+            exit 1
+          fi
+
+      # ══════════════════════════════════════════════════
+      # 🔍 DIAGNÓSTICO
+      # ══════════════════════════════════════════════════
+      - name: 🔍 Ejecutar diagnóstico
+        if: >-
+          inputs.action == 'diagnose' ||
+          inputs.action == 'full-pipeline'
+        run: |
+          ARGS="--db rosariogarage.db --dicts config/normalizer_dicts.json"
+
+          if [ -n "${{ inputs.marca }}" ]; then
+            ARGS="$ARGS --marca ${{ inputs.marca }}"
+          else
+            ARGS="$ARGS --all-brands"
+          fi
+
+          if [ "${{ inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
+
+          echo "🔍 Ejecutando: python diagnose_versions.py $ARGS"
+          python diagnose_versions.py $ARGS || true
+
+      # ══════════════════════════════════════════════════
+      # 🔧 FIX VERSIONES (dry-run)
+      # ══════════════════════════════════════════════════
+      - name: 🔧 Fix versiones (dry-run)
+        if: >-
+          inputs.action == 'fix-dry-run' ||
+          inputs.action == 'full-pipeline'
+        run: |
+          ARGS="--db rosariogarage.db --dicts config/normalizer_dicts.json --fix --dry-run"
+
+          if [ -n "${{ inputs.marca }}" ]; then
+            ARGS="$ARGS --marca ${{ inputs.marca }}"
+          else
+            ARGS="$ARGS --all-brands"
+          fi
+
+          if [ "${{ inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
+
+          echo "🔧 Ejecutando: python diagnose_versions.py $ARGS"
+          python diagnose_versions.py $ARGS || true
+
+      # ══════════════════════════════════════════════════
+      # 🔧 FIX VERSIONES (aplicar)
+      # ══════════════════════════════════════════════════
+      - name: 🔧 Fix versiones (aplicar cambios)
+        if: inputs.action == 'fix-apply'
+        run: |
+          ARGS="--db rosariogarage.db --dicts config/normalizer_dicts.json --fix"
+
+          if [ -n "${{ inputs.marca }}" ]; then
+            ARGS="$ARGS --marca ${{ inputs.marca }}"
+          else
+            ARGS="$ARGS --all-brands"
+          fi
+
+          if [ "${{ inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
+
+          echo "🔧 Ejecutando: python diagnose_versions.py $ARGS"
+          python diagnose_versions.py $ARGS
+
+      # ══════════════════════════════════════════════════
+      # 🧹 DB CLEANER (dry-run)
+      # ══════════════════════════════════════════════════
+      - name: 🧹 DB Cleaner (dry-run)
+        if: inputs.action == 'clean-dry-run'
+        run: |
+          ARGS="--db rosariogarage.db --dry-run"
+
+          if [ "${{ inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
+
+          echo "🧹 Ejecutando: python db_cleaner.py $ARGS"
+          python db_cleaner.py $ARGS
+
+      # ══════════════════════════════════════════════════
+      # 🧹 DB CLEANER (aplicar)
+      # ══════════════════════════════════════════════════
+      - name: 🧹 DB Cleaner (aplicar cambios)
+        if: >-
+          inputs.action == 'clean-db' ||
+          inputs.action == 'full-pipeline'
+        run: |
+          ARGS="--db rosariogarage.db"
+
+          if [ "${{ inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
+
+          echo "🧹 Ejecutando: python db_cleaner.py $ARGS"
+          python db_cleaner.py $ARGS
+
+      # ══════════════════════════════════════════════════
+      # 🔧 FULL PIPELINE: Fix + Clean
+      # ══════════════════════════════════════════════════
+      - name: 🔧 Fix versiones (full pipeline - aplicar)
+        if: inputs.action == 'full-pipeline'
+        run: |
+          ARGS="--db rosariogarage.db --dicts config/normalizer_dicts.json --fix"
+
+          if [ -n "${{ inputs.marca }}" ]; then
+            ARGS="$ARGS --marca ${{ inputs.marca }}"
+          else
+            ARGS="$ARGS --all-brands"
+          fi
+
+          echo "🔧 Aplicando fix de versiones..."
+          python diagnose_versions.py $ARGS
+
+      # ══════════════════════════════════════════════════
+      # 📊 ESTADÍSTICAS POST-FIX
+      # ══════════════════════════════════════════════════
+      - name: 📊 Estadísticas post-fix
+        if: always()
+        run: |
+          if [ ! -f "rosariogarage.db" ]; then
+            echo "❌ BD no disponible"
+            exit 0
+          fi
+
+          echo "═══════════════════════════════════════════"
+          echo "📊 ESTADO FINAL DE LA BD"
+          echo "═══════���═══════════════════════════════════"
+
+          echo ""
+          echo "📋 Vehículos por norm_status:"
+          sqlite3 rosariogarage.db "
+            SELECT
+              COALESCE(norm_status, 'NULL') as status,
+              COUNT(*) as total
+            FROM vehicles
+            WHERE activo = 1
+            GROUP BY norm_status
+            ORDER BY total DESC;
+          "
+
+          echo ""
+          echo "📋 Top 10 marcas - Versiones:"
+          sqlite3 -header -column rosariogarage.db "
+            SELECT
+              marca,
+              COUNT(*) as total,
+              SUM(CASE WHEN version IS NOT NULL
+                  AND version != '' THEN 1 ELSE 0 END) as con_ver,
+              ROUND(
+                SUM(CASE WHEN version IS NOT NULL
+                    AND version != '' THEN 1.0 ELSE 0 END)
+                / COUNT(*) * 100, 1
+              ) as pct_ver
+            FROM vehicles
+            WHERE activo = 1 AND marca IS NOT NULL
+            GROUP BY marca
+            ORDER BY total DESC
+            LIMIT 10;
+          "
+
+          echo ""
+          TARGET="${{ inputs.marca }}"
+          if [ -n "$TARGET" ]; then
+            echo "📋 Detalle $TARGET:"
+            sqlite3 -header -column rosariogarage.db "
+              SELECT
+                modelo,
+                COUNT(*) as total,
+                SUM(CASE WHEN version IS NOT NULL
+                    AND version != '' THEN 1 ELSE 0 END) as con_ver,
+                SUM(CASE WHEN norm_status='full_match'
+                    THEN 1 ELSE 0 END) as full_m
+              FROM vehicles
+              WHERE activo = 1
+                AND LOWER(marca) = LOWER('$TARGET')
+              GROUP BY modelo
+              ORDER BY total DESC
+              LIMIT 15;
+            "
+          fi
+
+          # Verificar changelog si existe
+          HAS_CL=$(sqlite3 rosariogarage.db "
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type='table' AND name='normalization_changelog';
+          ")
+          if [ "$HAS_CL" -gt 0 ]; then
+            CL_COUNT=$(sqlite3 rosariogarage.db "
+              SELECT COUNT(*) FROM normalization_changelog;
+            ")
+            echo ""
+            echo "📝 Changelog: $CL_COUNT entradas"
+            if [ "$CL_COUNT" -gt 0 ]; then
+              echo "   Últimas 5:"
+              sqlite3 -header -column rosariogarage.db "
+                SELECT vehicle_id, campo, valor_anterior,
+                       valor_nuevo, estrategia
+                FROM normalization_changelog
+                ORDER BY id DESC
+                LIMIT 5;
+              "
+            fi
+          fi
+
+      # ══════════════════════════════════════════════════
+      # 📤 SUBIR BD CORREGIDA
+      # ══════════════════════════════════════════════════
+      - name: 📤 Subir BD corregida (master)
+        if: >-
+          success() && (
+            inputs.action == 'fix-apply' ||
+            inputs.action == 'clean-db' ||
+            inputs.action == 'full-pipeline'
+          )
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-master-db
+          path: rosariogarage.db
+          retention-days: 90
+          compression-level: 9
+          overwrite: true
+
+      - name: 📦 Subir BD para dashboard
+        if: >-
+          success() && (
+            inputs.action == 'fix-apply' ||
+            inputs.action == 'clean-db' ||
+            inputs.action == 'full-pipeline'
+          )
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-db
+          path: rosariogarage.db
+          retention-days: 90
+          compression-level: 9
+          overwrite: true
+
+      # ══════════════════════════════════════════════════
+      # 📝 RESUMEN
+      # ══════════════════════════════════════════════════
+      - name: 📝 Resumen del workflow
+        if: always()
+        run: |
+          ACTION="${{ inputs.action }}"
+          MARCA="${{ inputs.marca }}"
+
+          if [ -f "rosariogarage.db" ]; then
+            TOTAL=$(sqlite3 rosariogarage.db \
+              "SELECT COUNT(*) FROM vehicles WHERE activo=1;")
+            CON_VER=$(sqlite3 rosariogarage.db "
+              SELECT COUNT(*) FROM vehicles
+              WHERE activo=1
+                AND version IS NOT NULL
+                AND version != '';
+            ")
+            FULL=$(sqlite3 rosariogarage.db "
+              SELECT COUNT(*) FROM vehicles
+              WHERE activo=1 AND norm_status='full_match';
+            ")
+          else
+            TOTAL="N/A"
+            CON_VER="N/A"
+            FULL="N/A"
+          fi
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # 🔧 DB Fix & Diagnóstico
+
+          **Acción:** \`${ACTION}\`
+          **Marca:** \`${MARCA:-todas}\`
+          **Fecha:** $(date +'%Y-%m-%d %H:%M:%S UTC')
+
+          ## 📊 Estado de la BD
+
+          | Métrica | Valor |
+          |---------|-------|
+          | Activos | **${TOTAL}** |
+          | Con versión | **${CON_VER}** |
+          | Full match | **${FULL}** |
+
+          ---
+          *Ver logs de cada paso para detalles completos*
+          EOF
