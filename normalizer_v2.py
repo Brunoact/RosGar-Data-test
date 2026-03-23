@@ -1205,7 +1205,7 @@ class VehicleNormalizerV4:
 
         return None
       
-      def _clean_version_input(self, version_raw, marca, modelo):      
+    def _clean_version_input(self, version_raw, marca, modelo):
         """Limpia version_raw quitando marca y modelo."""
         text = normalize_text(version_raw) if version_raw else ""
         if marca:
