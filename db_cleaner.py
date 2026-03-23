@@ -535,18 +535,24 @@ def extract_metadata_from_text(text: str) -> Dict[str, Any]:
     t = text.lower()
 
     # Puertas
-    m = re.search(r'\b([345])\s*[pP](?:uertas?)?\b', text, re.IGNORECASE)
+    m = re.search(
+        r'\b([345])\s*[pP](?:uertas?)?\b', text, re.IGNORECASE
+    )
     if m:
         result['puertas'] = int(m.group(1))
 
-    # Tracción
-    m = re.search(r'\b(4x[24])\b|(?i)\b(AWD|FWD|RWD)\b', text)
+    # Tracción ── FIX: (?i) inline → re.IGNORECASE como argumento
+    m = re.search(
+        r'\b(4x[24])\b|\b(AWD|FWD|RWD)\b', text, re.IGNORECASE
+    )
     if m:
         result['traccion'] = (m.group(1) or m.group(2)).lower()
 
     # GNC
-    if re.search(r'\bGNC\b|\bgas\s*natural\b|\bc[/\s]?GNC\b|\bcon\s+GNC\b',
-                 text, re.IGNORECASE):
+    if re.search(
+        r'\bGNC\b|\bgas\s*natural\b|\bc[/\s]?GNC\b|\bcon\s+GNC\b',
+        text, re.IGNORECASE
+    ):
         result['tiene_gnc'] = True
 
     # 0km
@@ -554,7 +560,6 @@ def extract_metadata_from_text(text: str) -> Dict[str, Any]:
         result['es_0km'] = True
 
     return result
-
 
 def reconstruct_version_input(v: Dict) -> str:
     """Reconstruye un texto de versión a partir de datos existentes."""
