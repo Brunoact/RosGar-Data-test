@@ -572,7 +572,7 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
     # Breakdown por status
     status_counts = {}
     for r in rows:
-        s = r[11] or 'NULL'  # norm_status es columna 11
+        s = r[11] or 'NULL'
         status_counts[s] = status_counts.get(s, 0) + 1
     for s, c in sorted(
         status_counts.items(), key=lambda x: -x[1]
@@ -582,10 +582,11 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
     examples_version = []
     examples_model = []
     examples_status = []
+    examples_skipped_model = []
+    examples_skipped_version = []
     batch_count = 0
 
     for i, row in enumerate(rows):
-        # Desempaquetar tupla por índice
         vid = row[0]
         marca = row[1] or ''
         modelo = row[2] or ''
@@ -630,47 +631,120 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
             new_status = norm.get('norm_status', 'fallback')
             new_confidence = norm.get('confidence', 0)
 
-            # ── Actualizar modelo si mejoró ──
+            # ══════════════════════════════════════════
+            # GUARDA 1: No "mejorar" modelo si el original
+            # es más específico (contiene al nuevo)
+            # Ejemplo: "c3 aircross" → "c3" es INCORRECTO
+            #          "hrv" → "hr-v" es CORRECTO (alias)
+            # ══════════════════════════════════════════
             new_modelo = norm.get('modelo')
+            model_changed = False
             if (new_modelo and norm.get('from_catalog')
                     and new_modelo != modelo):
-                updates['modelo'] = new_modelo
-                STATS.renorm_model_improved += 1
-                if len(examples_model) < 10:
-                    examples_model.append({
-                        'id': vid,
-                        'old': modelo,
-                        'new': new_modelo,
-                    })
+                modelo_lower = modelo.lower().strip()
+                new_modelo_lower = new_modelo.lower().strip()
 
-            # ── Actualizar versión si encontró ──
+                # Rechazar si el modelo original CONTIENE
+                # al nuevo (más específico → más genérico)
+                is_subset = (
+                    new_modelo_lower in modelo_lower
+                    and new_modelo_lower != modelo_lower
+                    and len(modelo_lower) > len(new_modelo_lower) + 1
+                )
+
+                if is_subset:
+                    # El original es más específico, no cambiar
+                    if len(examples_skipped_model) < 10:
+                        examples_skipped_model.append({
+                            'id': vid,
+                            'original': modelo,
+                            'proposed': new_modelo,
+                            'reason': 'original más específico',
+                        })
+                else:
+                    updates['modelo'] = new_modelo
+                    model_changed = True
+                    STATS.renorm_model_improved += 1
+                    if len(examples_model) < 10:
+                        examples_model.append({
+                            'id': vid,
+                            'old': modelo,
+                            'new': new_modelo,
+                        })
+
+            # ══════════════════════════════════════════
+            # GUARDA 2: No asignar versión si no había
+            # input de versión (evitar falsos positivos)
+            # ══════════════════════════════════════════
             new_version = norm.get('version')
             if new_version and not version:
-                updates['version'] = new_version
-                STATS.renorm_version_found += 1
-                if len(examples_version) < 15:
-                    examples_version.append({
-                        'id': vid,
-                        'marca': marca,
-                        'modelo': new_modelo or modelo,
-                        'input': version_input[:50],
-                        'version': new_version,
-                        'method': norm.get('version_method'),
-                        'conf': new_confidence,
-                    })
+                # Solo aceptar si había version_input real
+                has_real_input = (
+                    version_input
+                    and len(version_input.strip()) >= 3
+                    and version_input.strip().lower() != modelo.lower().strip()
+                )
+
+                if has_real_input:
+                    updates['version'] = new_version
+                    STATS.renorm_version_found += 1
+                    if len(examples_version) < 15:
+                        examples_version.append({
+                            'id': vid,
+                            'marca': marca,
+                            'modelo': (
+                                new_modelo if model_changed
+                                else modelo
+                            ),
+                            'input': version_input[:50],
+                            'version': new_version,
+                            'method': norm.get(
+                                'version_method'
+                            ),
+                            'conf': new_confidence,
+                        })
+                else:
+                    if len(examples_skipped_version) < 10:
+                        examples_skipped_version.append({
+                            'id': vid,
+                            'marca': marca,
+                            'modelo': modelo,
+                            'input': repr(version_input[:30]),
+                            'proposed': new_version,
+                            'reason': 'sin input real',
+                        })
 
             # ── Actualizar status si mejoró ──
             old_rank = STATUS_RANK.get(old_status, 0)
             new_rank = STATUS_RANK.get(new_status, 0)
             if new_rank > old_rank:
-                updates['norm_status'] = new_status
-                STATS.renorm_status_upgraded += 1
-                if len(examples_status) < 10:
-                    examples_status.append({
-                        'id': vid,
-                        'old': old_status,
-                        'new': new_status,
-                    })
+                # Si se propuso versión pero se rechazó,
+                # no subir a full_match
+                if (new_status == 'full_match'
+                        and 'version' not in updates
+                        and not version):
+                    # Máximo partial_match
+                    if STATUS_RANK.get(
+                        'partial_match', 0
+                    ) > old_rank:
+                        updates['norm_status'] = 'partial_match'
+                        STATS.renorm_status_upgraded += 1
+                        if len(examples_status) < 10:
+                            examples_status.append({
+                                'id': vid,
+                                'old': old_status,
+                                'new': 'partial_match',
+                                'note': 'capped (no version)',
+                            })
+                else:
+                    updates['norm_status'] = new_status
+                    STATS.renorm_status_upgraded += 1
+                    if len(examples_status) < 10:
+                        examples_status.append({
+                            'id': vid,
+                            'old': old_status,
+                            'new': new_status,
+                        })
 
             # ── Confidence ──
             updates['norm_confidence'] = new_confidence
@@ -748,7 +822,8 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
 
     if examples_version:
         logger.info(
-            f"\n   📋 {prefix}Ejemplos - Versiones encontradas:"
+            f"\n   📋 {prefix}Ejemplos - "
+            f"Versiones encontradas:"
         )
         for ex in examples_version[:10]:
             logger.info(
@@ -758,9 +833,22 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
                 f"conf:{ex['conf']})"
             )
 
+    if examples_skipped_version:
+        logger.info(
+            f"\n   🚫 {prefix}Versiones RECHAZADAS "
+            f"(sin input real):"
+        )
+        for ex in examples_skipped_version[:5]:
+            logger.info(
+                f"      [{ex['id']}] {ex['marca']} "
+                f"{ex['modelo']}: input={ex['input']} → "
+                f"propuso '{ex['proposed']}' — {ex['reason']}"
+            )
+
     if examples_model:
         logger.info(
-            f"\n   📋 {prefix}Ejemplos - Modelos mejorados:"
+            f"\n   📋 {prefix}Ejemplos - "
+            f"Modelos mejorados:"
         )
         for ex in examples_model[:5]:
             logger.info(
@@ -768,14 +856,26 @@ def step4_renormalize(conn, dry_run=False, dicts_path=None):
                 f"'{ex['new']}'"
             )
 
+    if examples_skipped_model:
+        logger.info(
+            f"\n   🚫 {prefix}Modelos RECHAZADOS "
+            f"(original más específico):"
+        )
+        for ex in examples_skipped_model[:5]:
+            logger.info(
+                f"      [{ex['id']}] '{ex['original']}' → "
+                f"'{ex['proposed']}' — {ex['reason']}"
+            )
+
     if examples_status:
         logger.info(
             f"\n   📋 {prefix}Ejemplos - Status upgrades:"
         )
         for ex in examples_status[:5]:
+            note = f" ({ex['note']})" if 'note' in ex else ''
             logger.info(
                 f"      [{ex['id']}] {ex['old']} → "
-                f"{ex['new']}"
+                f"{ex['new']}{note}"
             )
 
     logger.info(
