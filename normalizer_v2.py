@@ -620,62 +620,103 @@ class VehicleNormalizerV4:
     def __init__(self, catalog: EnrichedCatalog = None):
         self.catalog = catalog or CATALOG
 
-    def normalize(self, titulo="", descripcion="", marca_raw="",
-                  modelo_raw="", version_raw="",
-                  año_raw=None, precio_raw=None, km_raw=None) -> Dict:
+    def normalize(self, titulo="", descripcion="",
+                  marca_raw="", modelo_raw="", version_raw="",
+                  año_raw=None, precio_raw=None,
+                  km_raw=None) -> Dict:
         global STATS
         STATS.total += 1
 
         titulo_n = normalize_text(titulo)
-        desc_n = normalize_text(descripcion[:1000] if descripcion else "")
+        desc_n = normalize_text(
+            descripcion[:1000] if descripcion else ""
+        )
         marca_n = normalize_text(marca_raw)
         modelo_n = normalize_text(modelo_raw)
         version_n = normalize_text(version_raw)
+
         text_high = f"{titulo_n} {marca_n}"
         text_medium = f"{version_n} {modelo_n}"
         text_low = desc_n
         text_all = f"{text_high} {text_medium} {text_low}"
 
         result = {
-            'marca': None, 'modelo': None, 'version': None,
-            'año_detectado': None, 'año_fuente': None, 'año_sospechoso': False,
-            'norm_status': 'pending', 'from_catalog': False,
-            'match_method': None, 'confidence': 0, 'confidence_level': 'very_low',
-            'version_method': None, 'version_score': 0,
+            'marca': None,
+            'modelo': None,
+            'version': None,
+            'año_detectado': None,
+            'año_fuente': None,
+            'año_sospechoso': False,
+            'norm_status': 'pending',
+            'from_catalog': False,
+            'match_method': None,
+            'confidence': 0,
+            'confidence_level': 'very_low',
+            'version_method': None,
+            'version_score': 0,
             'extracted_data': {
-                'puertas': None, 'traccion': None, 'carroceria': None,
-                'tiene_gnc': None, 'es_0km': False,
+                'puertas': None,
+                'traccion': None,
+                'carroceria': None,
+                'tiene_gnc': None,
+                'es_0km': False,
             },
-            'warnings': [], 'corrections': [],
+            'warnings': [],
+            'corrections': [],
         }
 
         # ═══ PASO 0: AÑO ═══
-        año_desc = extract_year_from_description(descripcion or "") or extract_year_from_description(titulo or "")
-        año_q = assess_year_quality(año_structured=año_raw, año_description=año_desc, km=km_raw)
+        año_desc = (
+            extract_year_from_description(descripcion or "")
+            or extract_year_from_description(titulo or "")
+        )
+        año_q = assess_year_quality(
+            año_structured=año_raw,
+            año_description=año_desc,
+            km=km_raw
+        )
         año = año_q['best_year']
         result['año_detectado'] = año
         result['año_fuente'] = año_q['year_source']
+
         if año_q['quality'] == 'garbage':
             result['año_sospechoso'] = True
-            result['warnings'].append(f"Año basura: {año_q['reason']}")
+            result['warnings'].append(
+                f"Año basura: {año_q['reason']}"
+            )
             STATS.year_garbage_detected += 1
-            if año_q['year_source'] == 'description': STATS.year_from_description += 1
+            if año_q['year_source'] == 'description':
+                STATS.year_from_description += 1
         elif año_q['quality'] == 'suspicious':
             result['año_sospechoso'] = True
-            result['warnings'].append(f"Año sospechoso: {año_q['reason']}")
+            result['warnings'].append(
+                f"Año sospechoso: {año_q['reason']}"
+            )
+
         if not año:
             año = extract_year_from_text(titulo_n)
-            if año: result.update(año_detectado=año, año_fuente='title')
+            if año:
+                result.update(
+                    año_detectado=año, año_fuente='title'
+                )
             else:
                 año = extract_year_from_text(text_all)
-                if año: result.update(año_detectado=año, año_fuente='text')
+                if año:
+                    result.update(
+                        año_detectado=año, año_fuente='text'
+                    )
 
         # ═══ PASO 1: MARCA ═══
         marca_result = self._find_marca(marca_n, text_all)
         if not marca_result:
             STATS.fallback_used += 1
-            result.update(norm_status='no_marca', confidence=5, confidence_level='very_low')
+            result.update(
+                norm_status='no_marca',
+                confidence=5,
+                confidence_level='very_low'
+            )
             return result
+
         result['marca'] = marca_result['value']
         result['from_catalog'] = marca_result['from_catalog']
         marca = result['marca']
@@ -684,29 +725,103 @@ class VehicleNormalizerV4:
         for cand in [modelo_n, version_n]:
             if cand and self._is_motorization(cand, marca):
                 STATS.motorization_filtered += 1
-                result['warnings'].append(f"'{cand}' filtrado como motorización")
+                result['warnings'].append(
+                    f"'{cand}' filtrado como motorización"
+                )
 
         # ═══ PASO 3: MODELO (7 estrategias) ═══
         modelo_result = self._find_modelo(
-            marca=marca, titulo=titulo_n, modelo_raw=modelo_n,
-            version_raw=version_n, descripcion=desc_n,
-            text_high=text_high, text_medium=text_medium, text_all=text_all)
+            marca=marca,
+            titulo=titulo_n,
+            modelo_raw=modelo_n,
+            version_raw=version_n,
+            descripcion=desc_n,
+            text_high=text_high,
+            text_medium=text_medium,
+            text_all=text_all
+        )
+
         if modelo_result:
             result['modelo'] = modelo_result['value']
             result['match_method'] = modelo_result['method']
-            if modelo_result['from_catalog']: result['from_catalog'] = True
-            STATS.by_method[modelo_result['method']] = STATS.by_method.get(modelo_result['method'], 0) + 1
+            if modelo_result['from_catalog']:
+                result['from_catalog'] = True
+            STATS.by_method[modelo_result['method']] = (
+                STATS.by_method.get(
+                    modelo_result['method'], 0
+                ) + 1
+            )
+
+        # ═══ PASO 3.5: VALIDAR ESPECIFICIDAD DEL MODELO ═══
+        if (result['modelo'] and modelo_n
+                and result['from_catalog']):
+            orig = normalize_key(modelo_n)
+            nuevo = result['modelo']
+            # Si el input era más específico que el match
+            # (ej: "c3 aircross" matcheó "c3"), preservar
+            if (nuevo in orig
+                    and nuevo != orig
+                    and len(orig) > len(nuevo) + 1):
+                result['modelo'] = orig
+                result['warnings'].append(
+                    f"Modelo '{nuevo}' revertido a '{orig}' "
+                    f"(original más específico)"
+                )
+        # También validar con version_raw como fuente
+        # de modelo (cuando modelo_raw está vacío)
+        if (result['modelo'] and not modelo_n
+                and version_n and result['from_catalog']):
+            # Extraer lo que parece modelo del version_raw
+            vn_clean = version_n
+            if marca:
+                vn_clean = re.sub(
+                    r'\b' + re.escape(
+                        normalize_key(marca)
+                    ) + r'\b', '', vn_clean
+                ).strip()
+                vn_clean = re.sub(
+                    r'\b' + re.escape(
+                        normalize_key(marca).replace('-', ' ')
+                    ) + r'\b', '', vn_clean
+                ).strip()
+            if vn_clean:
+                # Si el version_raw contenía un modelo
+                # compuesto, verificar
+                nuevo = result['modelo']
+                vn_words = vn_clean.split()
+                # Buscar modelo compuesto: ej "c3 aircross"
+                for length in range(
+                    min(3, len(vn_words)), 0, -1
+                ):
+                    candidate = ' '.join(vn_words[:length])
+                    if (nuevo in candidate
+                            and nuevo != candidate
+                            and len(candidate) > len(nuevo) + 1):
+                        result['modelo'] = candidate
+                        result['warnings'].append(
+                            f"Modelo '{nuevo}' revertido a "
+                            f"'{candidate}' (version_raw más "
+                            f"específico)"
+                        )
+                        break
 
         # ═══ PASO 4: VERSIÓN (REESCRITO v5.0) ═══
         if result['from_catalog'] and result['modelo']:
             ver_result = self._find_version(
-                marca=marca, modelo=result['modelo'],
-                version_raw=version_n, search_text=text_all)
+                marca=marca,
+                modelo=result['modelo'],
+                version_raw=version_n,
+                search_text=text_all
+            )
             if ver_result:
                 result['version'] = ver_result['value']
-                result['version_method'] = ver_result.get('method')
-                result['version_score'] = ver_result.get('score', 0)
-                # Copiar metadata extraída durante descomposición
+                result['version_method'] = ver_result.get(
+                    'method'
+                )
+                result['version_score'] = ver_result.get(
+                    'score', 0
+                )
+                # Copiar metadata extraída
                 if 'extracted' in ver_result:
                     for k, v in ver_result['extracted'].items():
                         if v is not None:
@@ -716,7 +831,9 @@ class VehicleNormalizerV4:
         gnc = _detect_gnc(text_all)
         if gnc is not None:
             result['extracted_data']['tiene_gnc'] = gnc
-        result['extracted_data']['es_0km'] = _detect_0km(km_raw, text_all)
+        result['extracted_data']['es_0km'] = _detect_0km(
+            km_raw, text_all
+        )
 
         # ═══ PASO 5: POST-VALIDACIÓN ═══
         if result['from_catalog'] and result['modelo']:
@@ -727,6 +844,7 @@ class VehicleNormalizerV4:
 
         # ═══ PASO 7: STATUS ═══
         self._set_final_status(result)
+
         return result
 
     # ─────────────────────────────────────────────
@@ -765,67 +883,145 @@ class VehicleNormalizerV4:
     # ─────────────────────────────────────────────
     # MODELO (7 estrategias — sin cambios)
     # ─────────────────────────────────────────────
-    def _find_modelo(self, marca, titulo, modelo_raw, version_raw, descripcion, text_high, text_medium, text_all):
+    def _find_modelo(self, marca, titulo, modelo_raw, version_raw,
+                     descripcion, text_high, text_medium, text_all):
         mn = normalize_key(marca)
         modelos = self.catalog.get_models(marca)
-        if not modelos: return self._fallback_modelo(modelo_raw, version_raw, titulo, marca)
+        if not modelos:
+            return self._fallback_modelo(
+                modelo_raw, version_raw, titulo, marca
+            )
+
         combined = f"{version_raw} {modelo_raw} {titulo} {text_all}"
 
-        # 1. Exacto
+        # 1. Exacto (preferir match más largo/específico)
+        best_exact = None
+        best_exact_len = 0
         for m in modelos:
             if find_exact_in_text(m, combined):
-                return {'value': m, 'from_catalog': True, 'method': 'exact'}
+                if len(m) > best_exact_len:
+                    best_exact = m
+                    best_exact_len = len(m)
+        if best_exact:
+            return {
+                'value': best_exact,
+                'from_catalog': True,
+                'method': 'exact'
+            }
+
         # 2. Alias
         aliases = self.catalog.model_aliases.get(mn, {})
         for alias, real in aliases.items():
             if find_exact_in_text(alias, combined):
                 if self.catalog.has_model(mn, real):
-                    return {'value': real, 'from_catalog': True, 'method': 'alias'}
+                    return {
+                        'value': real,
+                        'from_catalog': True,
+                        'method': 'alias'
+                    }
+
         # 3. Códigos
         codes = self.catalog.code_mappings.get(mn, {})
         if codes:
-            for code in sorted(codes.keys(), key=len, reverse=True):
+            for code in sorted(
+                codes.keys(), key=len, reverse=True
+            ):
                 if find_exact_in_text(code, combined):
                     mapped = codes[code]
                     if isinstance(mapped, dict):
-                        if mapped.get('ambiguo'): mapped_model = mapped.get('modelos', [None])[0]
-                        else: continue
-                    else: mapped_model = mapped
-                    if mapped_model and self.catalog.has_model(marca, mapped_model):
-                        return {'value': mapped_model, 'from_catalog': True, 'method': 'code_mapping'}
+                        if mapped.get('ambiguo'):
+                            mapped_model = mapped.get(
+                                'modelos', [None]
+                            )[0]
+                        else:
+                            continue
+                    else:
+                        mapped_model = mapped
+                    if mapped_model and self.catalog.has_model(
+                        marca, mapped_model
+                    ):
+                        return {
+                            'value': mapped_model,
+                            'from_catalog': True,
+                            'method': 'code_mapping'
+                        }
+
         # 4. Nombre base
         for src in [version_raw, modelo_raw, titulo]:
             if src:
                 for w in src.split():
-                    if len(w) >= 3 and not re.match(r'^\d+$', w):
+                    if (len(w) >= 3
+                            and not re.match(r'^\d+$', w)):
                         wc = re.sub(r'\d+', '', w).strip()
                         if wc and len(wc) >= 3:
                             for m in modelos:
-                                if wc == m or find_exact_in_text(wc, m):
-                                    return {'value': m, 'from_catalog': True, 'method': 'base_name'}
+                                if (wc == m
+                                        or find_exact_in_text(
+                                            wc, m
+                                        )):
+                                    return {
+                                        'value': m,
+                                        'from_catalog': True,
+                                        'method': 'base_name'
+                                    }
+
         # 5. Descripción
         if descripcion:
-            md = extract_model_from_description(descripcion, marca, modelos)
+            md = extract_model_from_description(
+                descripcion, marca, modelos
+            )
             if md:
                 STATS.model_from_description += 1
-                return {'value': md, 'from_catalog': True, 'method': 'description'}
+                return {
+                    'value': md,
+                    'from_catalog': True,
+                    'method': 'description'
+                }
+
         # 6. Version split
         if version_raw:
-            sp = split_version_into_model_and_trim(version_raw, modelos, marca)
+            sp = split_version_into_model_and_trim(
+                version_raw, modelos, marca
+            )
             if sp:
                 STATS.model_from_version_split += 1
-                return {'value': sp['model'], 'from_catalog': True, 'method': 'version_split'}
+                return {
+                    'value': sp['model'],
+                    'from_catalog': True,
+                    'method': 'version_split'
+                }
+
         # 7. Fuzzy
         if CONFIG.enable_fuzzy and modelos:
-            fc = [m for m in modelos if not is_numeric_model(m)]
-            if not fc: STATS.numeric_exact_only += 1
+            fc = [
+                m for m in modelos
+                if not is_numeric_model(m)
+            ]
+            if not fc:
+                STATS.numeric_exact_only += 1
             else:
                 for w in combined.split():
-                    if len(w) >= CONFIG.fuzzy_min_word_length and w.lower() not in FUZZY_BLACKLIST and not re.match(r'^(19|20)\d{2}$', w) and not re.match(r'^\d+$', w):
-                        match = fuzzy_match(w, fc, CONFIG.fuzzy_threshold_modelo)
-                        if match: return {'value': match[0], 'from_catalog': True, 'method': 'fuzzy'}
+                    if (len(w) >= CONFIG.fuzzy_min_word_length
+                            and w.lower() not in FUZZY_BLACKLIST
+                            and not re.match(
+                                r'^(19|20)\d{2}$', w
+                            )
+                            and not re.match(r'^\d+$', w)):
+                        match = fuzzy_match(
+                            w, fc,
+                            CONFIG.fuzzy_threshold_modelo
+                        )
+                        if match:
+                            return {
+                                'value': match[0],
+                                'from_catalog': True,
+                                'method': 'fuzzy'
+                            }
+
         # 8. Fallback
-        return self._fallback_modelo(modelo_raw, version_raw, titulo, marca)
+        return self._fallback_modelo(
+            modelo_raw, version_raw, titulo, marca
+        )
 
     def _fallback_modelo(self, modelo_raw, version_raw, titulo, marca):
         combined = f"{version_raw} {modelo_raw} {titulo}"
@@ -841,94 +1037,171 @@ class VehicleNormalizerV4:
     # ─────────────────────────────────────────────────
     # VERSIÓN — REESCRITO v5.0 (matching por componentes)
     # ─────────────────────────────────────────────────
-    def _find_version(self, marca, modelo, version_raw, search_text) -> Optional[Dict]:
+    def _find_version(self, marca, modelo, version_raw,
+                      search_text) -> Optional[Dict]:
         versiones = self.catalog.get_versions(marca, modelo)
         if not versiones:
             return None
 
+        # ── GUARDA: Sin input real, no intentar matching ──
+        if not version_raw or len(version_raw.strip()) < 2:
+            return None
+
         key = make_key(marca, modelo)
-        cat_components = self.catalog.version_components.get(key, {})
+        cat_components = self.catalog.version_components.get(
+            key, {}
+        )
         search_norm = normalize_text(search_text)
-        versiones_sorted = sorted(versiones, key=len, reverse=True)
+        versiones_sorted = sorted(
+            versiones, key=len, reverse=True
+        )
 
         # ── 1. Match exacto completo ──
         for v in versiones_sorted:
             if find_exact_in_text(v, search_norm):
                 STATS.version_exact_match += 1
-                return {'value': v, 'from_catalog': True, 'method': 'exact', 'score': 100}
+                return {
+                    'value': v,
+                    'from_catalog': True,
+                    'method': 'exact',
+                    'score': 100
+                }
 
         # ── 2. Descomponer input de usuario ──
-        clean_input = self._clean_version_input(version_raw, marca, modelo)
-        user_comp = self._decompose_and_normalize(clean_input, search_norm)
+        clean_input = self._clean_version_input(
+            version_raw, marca, modelo
+        )
+
+        # Si después de limpiar no queda nada útil, salir
+        if not clean_input or len(clean_input.strip()) < 2:
+            return None
+
+        user_comp = self._decompose_and_normalize(
+            clean_input, search_norm
+        )
 
         # ── 3. Scoring por componentes ──
-        if cat_components and (user_comp.get('trim') or user_comp.get('motor_canonical')):
+        if cat_components and (
+            user_comp.get('trim')
+            or user_comp.get('motor_canonical')
+        ):
             best_match, best_score, best_detail = None, 0, None
+
             for version, cc in cat_components.items():
-                score, detail = self._score_version_components(user_comp, cc)
+                score, detail = self._score_version_components(
+                    user_comp, cc
+                )
                 if score > best_score:
-                    best_score, best_match, best_detail = score, version, detail
+                    best_score = score
+                    best_match = version
+                    best_detail = detail
 
             threshold = self._adaptive_threshold(user_comp)
+
             if best_match and best_score >= threshold:
                 STATS.version_component_match += 1
                 return {
-                    'value': best_match, 'from_catalog': True,
-                    'method': 'component_match', 'score': best_score,
+                    'value': best_match,
+                    'from_catalog': True,
+                    'method': 'component_match',
+                    'score': best_score,
                     'extracted': {
                         'puertas': user_comp.get('puertas'),
                         'traccion': user_comp.get('traccion'),
-                        'carroceria': user_comp.get('carroceria'),
-                        'tiene_gnc': user_comp.get('tiene_gnc'),
+                        'carroceria': user_comp.get(
+                            'carroceria'
+                        ),
+                        'tiene_gnc': user_comp.get(
+                            'tiene_gnc'
+                        ),
                     },
                 }
 
         # ── 4. Trim en search_text (descripción, título) ──
-        known_trims = self.catalog.known_trims_by_model.get(key, [])
+        known_trims = self.catalog.known_trims_by_model.get(
+            key, []
+        )
         if known_trims:
-            for trim in sorted(known_trims, key=len, reverse=True):
-                if len(trim) >= 2 and find_exact_in_text(trim, search_norm):
-                    # Buscar versión con ese trim
+            for trim in sorted(
+                known_trims, key=len, reverse=True
+            ):
+                if (len(trim) >= 2
+                        and find_exact_in_text(
+                            trim, search_norm
+                        )):
                     for version, cc in cat_components.items():
                         if cc.get('trim') == trim:
                             STATS.version_trim_match += 1
                             return {
-                                'value': version, 'from_catalog': True,
-                                'method': 'trim_from_text', 'score': 60,
+                                'value': version,
+                                'from_catalog': True,
+                                'method': 'trim_from_text',
+                                'score': 60,
                                 'extracted': {
-                                    'puertas': user_comp.get('puertas'),
-                                    'traccion': user_comp.get('traccion'),
-                                    'carroceria': user_comp.get('carroceria'),
-                                    'tiene_gnc': user_comp.get('tiene_gnc'),
+                                    'puertas': user_comp.get(
+                                        'puertas'
+                                    ),
+                                    'traccion': user_comp.get(
+                                        'traccion'
+                                    ),
+                                    'carroceria': user_comp.get(
+                                        'carroceria'
+                                    ),
+                                    'tiene_gnc': user_comp.get(
+                                        'tiene_gnc'
+                                    ),
                                 },
                             }
 
         # ── 5. Trim en trim_index de la marca ──
         if user_comp.get('trim'):
-            brand_trims = self.catalog.trim_index.get(normalize_key(marca), {})
+            brand_trims = self.catalog.trim_index.get(
+                normalize_key(marca), {}
+            )
             modelo_norm = normalize_key(modelo)
             trim_val = user_comp['trim']
-            if trim_val in brand_trims and modelo_norm in brand_trims[trim_val]:
+            if (trim_val in brand_trims
+                    and modelo_norm in brand_trims[trim_val]):
                 for version, cc in cat_components.items():
                     if cc.get('trim') == trim_val:
                         STATS.version_trim_match += 1
                         return {
-                            'value': version, 'from_catalog': True,
-                            'method': 'trim_index', 'score': 55,
+                            'value': version,
+                            'from_catalog': True,
+                            'method': 'trim_index',
+                            'score': 55,
                             'extracted': {
-                                'puertas': user_comp.get('puertas'),
-                                'traccion': user_comp.get('traccion'),
-                                'carroceria': user_comp.get('carroceria'),
-                                'tiene_gnc': user_comp.get('tiene_gnc'),
+                                'puertas': user_comp.get(
+                                    'puertas'
+                                ),
+                                'traccion': user_comp.get(
+                                    'traccion'
+                                ),
+                                'carroceria': user_comp.get(
+                                    'carroceria'
+                                ),
+                                'tiene_gnc': user_comp.get(
+                                    'tiene_gnc'
+                                ),
                             },
                         }
 
         # ── 6. Fuzzy sobre versiones (restrictivo) ──
         if CONFIG.enable_fuzzy:
             for w in search_norm.split():
-                if len(w) >= 3 and w not in FUZZY_BLACKLIST:
-                    m = fuzzy_match(w, versiones, CONFIG.fuzzy_threshold_version)
-                    if m: return {'value': m[0], 'from_catalog': True, 'method': 'fuzzy', 'score': m[1]}
+                if (len(w) >= 3
+                        and w not in FUZZY_BLACKLIST):
+                    m = fuzzy_match(
+                        w, versiones,
+                        CONFIG.fuzzy_threshold_version
+                    )
+                    if m:
+                        return {
+                            'value': m[0],
+                            'from_catalog': True,
+                            'method': 'fuzzy',
+                            'score': m[1]
+                        }
 
         return None
 
