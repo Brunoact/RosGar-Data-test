@@ -886,14 +886,19 @@ async def fetch_vehicle_details(
         titulo = (raw.get('titulo') or '').strip()
         descripcion = raw.get('descripcion') or ''
 
-        # Pre-limpieza: quitar marca de version_raw si ya se conoce
+        # Extraer modelo original del version_raw para
+        # referencia (antes de pre-limpieza)
+        modelo_original = extract_model_from_version(
+            version_raw, marca_raw
+        )
+
+        # Pre-limpieza: quitar marca de version_raw
         version_for_norm = version_raw
         if marca_raw and version_for_norm:
             version_for_norm = re.sub(
                 r'\b' + re.escape(marca_raw) + r'\b',
                 '', version_for_norm, flags=re.IGNORECASE
             ).strip()
-            # También sin guiones
             marca_nohyphen = marca_raw.replace('-', ' ')
             if marca_nohyphen != marca_raw:
                 version_for_norm = re.sub(
@@ -932,14 +937,14 @@ async def fetch_vehicle_details(
                     if result['año'] != año_detectado:
                         if DEBUG_MODE:
                             logger.debug(
-                                f"Año corregido: {result['año']} → "
+                                f"Año corregido: "
+                                f"{result['año']} → "
                                 f"{año_detectado} (fuente: "
                                 f"{norm.get('año_fuente')})"
                             )
                         result['año'] = año_detectado
 
-                # Extraer metadata del normalizer si no se
-                # obtuvo del HTML
+                # Extraer metadata del normalizer
                 extracted = norm.get('extracted_data', {})
                 if (extracted.get('puertas')
                         and not result['puertas']):
@@ -953,6 +958,49 @@ async def fetch_vehicle_details(
                 if (extracted.get('es_0km')
                         and not result['es_0km']):
                     result['es_0km'] = 1
+
+                # ═══════════════════════════════════════
+                # 🛡️ GUARDAS POST-NORMALIZACIÓN v2.6
+                # ═══════════════════════════════════════
+
+                # GUARDA 1: No degradar modelo específico
+                # "c3 aircross" → "c3" es INCORRECTO
+                # "hrv" → "hr-v" es CORRECTO (alias)
+                if (result['modelo'] and modelo_original
+                        and result['modelo'] != modelo_original):
+                    orig = modelo_original.lower().strip()
+                    nuevo = result['modelo'].lower().strip()
+                    if (nuevo in orig
+                            and nuevo != orig
+                            and len(orig) > len(nuevo) + 1):
+                        if DEBUG_MODE:
+                            logger.debug(
+                                f"  🛡️ {basic['id']}: modelo "
+                                f"'{result['modelo']}' rechazado"
+                                f", original "
+                                f"'{modelo_original}' es más "
+                                f"específico"
+                            )
+                        result['modelo'] = modelo_original
+                        if (result['norm_status']
+                                == 'full_match'):
+                            result['norm_status'] = (
+                                'partial_match'
+                            )
+                            result['version'] = None
+
+                # GUARDA 2: No asignar versión sin input real
+                if (result['version']
+                        and not version_raw.strip()):
+                    if DEBUG_MODE:
+                        logger.debug(
+                            f"  🛡️ {basic['id']}: versión "
+                            f"'{result['version']}' rechazada"
+                            f", sin version_raw"
+                        )
+                    result['version'] = None
+                    if result['norm_status'] == 'full_match':
+                        result['norm_status'] = 'partial_match'
 
                 # Log warnings en debug
                 if DEBUG_MODE and norm.get('warnings'):
