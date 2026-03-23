@@ -1,5 +1,4 @@
 # .github/workflows/scrape.yml
-
 name: 🚗 RosarioGarage Scraper
 
 on:
@@ -18,11 +17,9 @@ env:
   TOTAL_WORKERS: 8
 
 jobs:
-
-# ══════════════════════════════════════════════════════════════
-# JOB 1: Scraping distribuido en 8 workers
-# ══════════════════════════════════════════════════════════════
-
+  # ══════════════════════════════════════════════════════════════
+  # JOB 1: Scraping distribuido en 8 workers
+  # ══════════════════════════════════════════════════════════════
   scrape:
     name: 🔹 Worker ${{ matrix.worker_id }}
     runs-on: ubuntu-latest
@@ -83,10 +80,9 @@ jobs:
           compression-level: 6
           if-no-files-found: error
 
-# ══════════════════════════════════════════════════════════════
-# JOB 2: Consolidar resultados de todos los workers
-# ══════════════════════════════════════════════════════════════
-
+  # ══════════════════════════════════════════════════════════════
+  # JOB 2: Consolidar resultados de todos los workers
+  # ══════════════════════════════════════════════════════════════
   consolidate:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
@@ -127,7 +123,6 @@ jobs:
             echo "ℹ️ No existe BD maestra anterior (primera ejecución)"
           fi
 
-      # ── FIX: crear el directorio ANTES de descargar ──────────
       - name: 📁 Crear directorio para workers
         run: mkdir -p ./worker_downloads
 
@@ -138,7 +133,6 @@ jobs:
           path: ./worker_downloads/
           merge-multiple: false
 
-      # ── FIX: diagnóstico detallado antes de organizar ────────
       - name: 🔎 Diagnóstico de artifacts descargados
         run: |
           echo "=== Contenido de worker_downloads ==="
@@ -157,14 +151,11 @@ jobs:
         run: |
           echo "=== Moviendo archivos al directorio raíz ==="
 
-          # Buscar .db en cualquier nivel de profundidad dentro de worker_downloads
           FOUND_FILES=$(find ./worker_downloads -type f -name "rosariogarage_worker_*.db" 2>/dev/null)
 
           if [ -z "$FOUND_FILES" ]; then
             echo "⚠️ No se encontraron archivos con patrón rosariogarage_worker_*.db"
             echo "Buscando cualquier .db descargado..."
-
-            # Fallback: mover cualquier .db que haya descargado
             find ./worker_downloads -type f -name "*.db" 2>/dev/null | while read f; do
               echo "  Encontrado: $f"
               mv "$f" .
@@ -179,12 +170,10 @@ jobs:
           echo ""
           echo "=== Archivos .db en directorio actual ==="
           ls -lh *.db 2>/dev/null || echo "No hay archivos .db"
-
           echo ""
           echo "=== Verificación detallada de workers ==="
           FOUND=0
           TOTAL_VEHICLES=0
-
           for i in {0..7}; do
             DB_FILE="rosariogarage_worker_${i}.db"
             if [ -f "$DB_FILE" ]; then
@@ -197,7 +186,6 @@ jobs:
               echo "❌ Worker ${i}: NO ENCONTRADO"
             fi
           done
-
           echo ""
           echo "════════════════════════════════════════"
           echo "📊 RESUMEN: ${FOUND}/8 workers encontrados"
@@ -208,7 +196,6 @@ jobs:
             echo "❌ ERROR CRÍTICO: No se encontró ningún archivo de worker"
             exit 1
           fi
-
           if [ $FOUND -lt 4 ]; then
             echo "⚠️ ADVERTENCIA: Solo ${FOUND}/8 workers disponibles"
           fi
@@ -242,9 +229,9 @@ jobs:
               print(f"📅 Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
               print()
 
-              total    = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
-              activos  = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
-              inactivos= conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
+              total     = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+              activos   = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
+              inactivos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 0").fetchone()[0]
 
               print(f"🚗 VEHÍCULOS")
               print(f"   Total en BD:     {format_number(total)}")
@@ -268,6 +255,29 @@ jobs:
               print(f"   └─ Sin match:    {format_number(no_match)}")
               print()
 
+              # ── NUEVOS v2.6: Estadísticas de campos nuevos ──
+              try:
+                  meta_stats = conn.execute("""
+                      SELECT
+                        SUM(CASE WHEN puertas IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN traccion IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN tiene_gnc = 1 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN es_0km = 1 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN version_raw IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN descripcion IS NOT NULL THEN 1 ELSE 0 END)
+                      FROM vehicles WHERE activo = 1
+                  """).fetchone()
+                  print(f"📋 METADATA EXTRAÍDA (activos)")
+                  print(f"   ├─ Con puertas:      {format_number(meta_stats[0] or 0)}")
+                  print(f"   ├─ Con tracción:     {format_number(meta_stats[1] or 0)}")
+                  print(f"   ├─ Con GNC:          {format_number(meta_stats[2] or 0)}")
+                  print(f"   ├─ 0km:              {format_number(meta_stats[3] or 0)}")
+                  print(f"   ├─ Con version_raw:  {format_number(meta_stats[4] or 0)}")
+                  print(f"   └─ Con descripción:  {format_number(meta_stats[5] or 0)}")
+                  print()
+              except Exception:
+                  pass
+
               today = date.today().isoformat()
               nuevos_hoy = conn.execute(
                   "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?", (today,)
@@ -287,13 +297,14 @@ jobs:
               print()
 
               precio_stats = conn.execute("""
-                  SELECT
-                      MIN(precio_usd) as min_precio,
-                      MAX(precio_usd) as max_precio,
-                      AVG(precio_usd) as avg_precio,
-                      COUNT(*) as count
+                  SELECT MIN(precio_usd) as min_precio,
+                         MAX(precio_usd) as max_precio,
+                         AVG(precio_usd) as avg_precio,
+                         COUNT(*) as count
                   FROM vehicles
-                  WHERE activo = 1 AND precio_usd IS NOT NULL AND precio_usd > 0
+                  WHERE activo = 1
+                    AND precio_usd IS NOT NULL
+                    AND precio_usd > 0
               """).fetchone()
 
               if precio_stats[3] > 0:
@@ -308,9 +319,7 @@ jobs:
                   SELECT marca, COUNT(*) as c
                   FROM vehicles
                   WHERE activo = 1 AND marca IS NOT NULL AND marca != ''
-                  GROUP BY marca
-                  ORDER BY c DESC
-                  LIMIT 10
+                  GROUP BY marca ORDER BY c DESC LIMIT 10
               """):
                   bar = '█' * min(30, max(1, int(count * 30 / max(activos, 1))))
                   print(f"   {marca:15s} {count:5} {bar}")
@@ -340,10 +349,8 @@ jobs:
 
               if 'last_dolar_mep' in metadata:
                   print(f"💵 Dólar MEP: ${float(metadata['last_dolar_mep']):.2f}")
-
               if 'workers_consolidated' in metadata:
                   print(f"👷 Workers consolidados: {metadata['workers_consolidated']}")
-
               if 'rate_limits_429' in metadata and int(metadata.get('rate_limits_429', 0)) > 0:
                   print(f"⚠️ Rate limits detectados: {metadata['rate_limits_429']}")
 
@@ -354,7 +361,7 @@ jobs:
                   repubs = conn.execute("SELECT COUNT(*) FROM republication_log").fetchone()[0]
                   if repubs > 0:
                       print(f"🔁 Re-publicaciones detectadas: {format_number(repubs)}")
-              except:
+              except Exception:
                   pass
 
               print("=" * 60)
@@ -371,9 +378,12 @@ jobs:
                   "agencias":         agencias,
                   "con_urgencia":     con_urgencia,
                   "dolar_mep":        float(metadata.get('last_dolar_mep', 0)),
-                  "workers":          int(metadata.get('workers_consolidated', 0))
+                  "workers":          int(metadata.get('workers_consolidated', 0)),
+                  "con_puertas":      int(meta_stats[0] or 0) if meta_stats else 0,
+                  "con_traccion":     int(meta_stats[1] or 0) if meta_stats else 0,
+                  "con_gnc":          int(meta_stats[2] or 0) if meta_stats else 0,
+                  "con_0km":          int(meta_stats[3] or 0) if meta_stats else 0,
               }
-
               with open("summary.json", "w") as f:
                   json.dump(summary_data, f)
 
@@ -391,7 +401,6 @@ jobs:
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
           SIZE_HR=$(du -h rosariogarage.db | cut -f1)
           echo "💾 Tamaño actual: $SIZE_HR"
-
           if [ $SIZE_MB -gt 50 ]; then
             echo "🔧 Ejecutando VACUUM para optimizar..."
             sqlite3 rosariogarage.db "VACUUM;"
@@ -448,18 +457,17 @@ jobs:
             URGENCIA=$(jq -r '.con_urgencia' summary.json)
             DOLAR=$(jq -r '.dolar_mep' summary.json)
             WORKERS=$(jq -r '.workers' summary.json)
+            CON_PUERTAS=$(jq -r '.con_puertas // 0' summary.json)
+            CON_TRACCION=$(jq -r '.con_traccion // 0' summary.json)
+            CON_GNC=$(jq -r '.con_gnc // 0' summary.json)
+            CON_0KM=$(jq -r '.con_0km // 0' summary.json)
           else
-            ACTIVOS="Error"
-            NUEVOS="Error"
-            ACTUALIZADOS="Error"
-            CAMBIOS="Error"
-            NORMALIZADOS="Error"
-            PARCIALES="Error"
-            PARTICULARES="Error"
-            AGENCIAS="Error"
-            URGENCIA="Error"
-            DOLAR="Error"
-            WORKERS="Error"
+            ACTIVOS="Error"; NUEVOS="Error"; ACTUALIZADOS="Error"
+            CAMBIOS="Error"; NORMALIZADOS="Error"; PARCIALES="Error"
+            PARTICULARES="Error"; AGENCIAS="Error"; URGENCIA="Error"
+            DOLAR="Error"; WORKERS="Error"
+            CON_PUERTAS="Error"; CON_TRACCION="Error"
+            CON_GNC="Error"; CON_0KM="Error"
           fi
 
           cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -485,6 +493,15 @@ jobs:
           | ✅ Completa (marca+modelo+versión) | **${NORMALIZADOS}** |
           | 🟡 Parcial (marca+modelo) | **${PARCIALES}** |
 
+          ## 📋 Metadata Extraída
+
+          | Campo | Cantidad |
+          |-------|----------|
+          | 🚪 Con puertas | **${CON_PUERTAS}** |
+          | 🛞 Con tracción | **${CON_TRACCION}** |
+          | ⛽ Con GNC | **${CON_GNC}** |
+          | 🆕 0km | **${CON_0KM}** |
+
           ## 👤 Vendedores
 
           | Tipo | Cantidad |
@@ -504,10 +521,9 @@ jobs:
           *Ver logs del paso "Generar estadísticas detalladas" para más información*
           EOF
 
-# ══════════════════════════════════════════════════════════════
-# JOB 3: Limpieza de artifacts de workers
-# ══════════════════════════════════════════════════════════════
-
+  # ══════════════════════════════════════════════════════════════
+  # JOB 3: Limpieza de artifacts de workers
+  # ══════════════════════════════════════════════════════════════
   cleanup:
     name: 🧹 Limpieza
     runs-on: ubuntu-latest
@@ -521,10 +537,9 @@ jobs:
           name: worker-*-db
           failOnError: false
 
-# ══════════════════════════════════════════════════════════════
-# JOB 4: Notificación en caso de error
-# ══════════════════════════════════════════════════════════════
-
+  # ══════════════════════════════════════════════════════════════
+  # JOB 4: Notificación en caso de error
+  # ══════════════════════════════════════════════════════════════
   notify-failure:
     name: 🚨 Notificar Fallo
     runs-on: ubuntu-latest
@@ -542,7 +557,6 @@ jobs:
           El proceso de scraping ha fallado. Revisar los logs para más detalles.
 
           ## 🔍 Pasos para diagnosticar:
-
           1. Revisar logs del paso "🔎 Diagnóstico de artifacts descargados"
           2. Verificar el paso "📋 Organizar archivos de workers"
           3. Comprobar si el sitio web está accesible
