@@ -1285,41 +1285,65 @@ class VehicleNormalizerV4:
                 STATS.by_method.get(modelo_result['method'], 0) + 1
             )
 
-        # ═══════════════════════════════════════════════════
-        # PASO 4: VERSIÓN — REESCRITO v6.0
-        # ═══════════════════════════════════════════════════
-        if result['from_catalog'] and result['modelo']:
-            ver_result = self._find_version(
-                marca=marca,
-                modelo=result['modelo'],
-                version_raw=version_n,
-                search_text=text_all,
-            )
-            if ver_result:
-                result['version'] = ver_result['value']
-                result['version_method'] = (
-                    ver_result.get('method')
+            # ═══════════════════════════════════════════════════
+            # PASO 4: VERSIÓN — v6.1
+            # ═══════════════════════════════════════════════════
+            if result['from_catalog'] and result['modelo']:
+                ver_result = self._find_version(
+                    marca=marca,
+                    modelo=result['modelo'],
+                    version_raw=version_n,
+                    search_text=text_all,
                 )
-                result['version_score'] = (
-                    ver_result.get('score', 0)
-                )
-                # Propagar motor y trans del match
-                if ver_result.get('motor'):
-                    result['motor'] = ver_result['motor']
-                if ver_result.get('trans'):
-                    result['transmision_normalizada'] = (
-                        ver_result['trans']
+                if ver_result:
+                    result['version'] = ver_result['value']
+                    result['version_method'] = (
+                        ver_result.get('method')
                     )
-                if 'extracted' in ver_result:
-                    for k, v in (
-                        ver_result['extracted'].items()
-                    ):
-                        if v is not None:
-                            result['extracted_data'][k] = v)
-                if 'extracted' in ver_result:
-                    for k, v in ver_result['extracted'].items():
-                        if v is not None:
-                            result['extracted_data'][k] = v
+                    result['version_score'] = (
+                        ver_result.get('score', 0)
+                    )
+                    # Propagar motor y trans del match
+                    if ver_result.get('motor'):
+                        result['motor'] = (
+                            ver_result['motor']
+                        )
+                    if ver_result.get('trans'):
+                        result['transmision_normalizada'] = (
+                            ver_result['trans']
+                        )
+                    # Propagar metadata extraída
+                    if 'extracted' in ver_result:
+                        for k, v in ver_result[
+                            'extracted'
+                        ].items():
+                            if v is not None:
+                                result[
+                                    'extracted_data'
+                                ][k] = v
+
+            # ═══ PASO 4.1: MOTOR Y TRANSMISIÓN ═══
+            if result['from_catalog'] and result['modelo']:
+                if not result.get('motor'):
+                    clean_input = self._clean_version_input(
+                        version_n, marca, result['modelo']
+                    )
+                    user_comp = (
+                        self._decompose_and_normalize(
+                            clean_input, text_all
+                        )
+                    )
+                    if user_comp.get('motor_canonical'):
+                        result['motor'] = (
+                            user_comp['motor_canonical']
+                        )
+                    if (user_comp.get('trans_canonical')
+                            and not result.get(
+                                'transmision_normalizada'
+                            )):
+                        result[
+                            'transmision_normalizada'
+                        ] = user_comp['trans_canonical']
 
         
         # ═══ PASO 4.1: MOTOR Y TRANSMISIÓN ═══
