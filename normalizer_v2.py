@@ -974,6 +974,61 @@ class EnrichedCatalog:
             return model_data
 
         return []
+        
+    def get_trims(self, brand, model) -> List[str]:
+        """Retorna trims puros de un modelo."""
+        key = make_key(brand, model)
+        # 1. trims_by_model (v3.0)
+        trims = self._data.get(
+            'trims_by_model', {}
+        ).get(key, [])
+        if trims:
+            return trims
+        # 2. Fallback: catalog_index.trims
+        brand_norm = normalize_key(brand)
+        model_norm = normalize_key(model)
+        model_data = (
+            self.catalog_index
+            .get(brand_norm, {})
+            .get(model_norm, {})
+        )
+        if isinstance(model_data, dict):
+            return model_data.get('trims', [])
+        return []
+
+    def get_motors(self, brand, model) -> List[str]:
+        """Retorna motores de un modelo."""
+        key = make_key(brand, model)
+        motors = self._data.get(
+            'motors_by_model', {}
+        ).get(key, [])
+        if motors:
+            return motors
+        brand_norm = normalize_key(brand)
+        model_norm = normalize_key(model)
+        model_data = (
+            self.catalog_index
+            .get(brand_norm, {})
+            .get(model_norm, {})
+        )
+        if isinstance(model_data, dict):
+            return model_data.get('motors', [])
+        return []
+
+    def has_trim(self, brand, model, trim) -> bool:
+        """Verifica si un trim existe para un modelo."""
+        trims = self.get_trims(brand, model)
+        trim_norm = normalize_key(trim)
+        return trim_norm in [
+            normalize_key(t) for t in trims
+        ]
+
+    def get_valid_combos(self, brand, model) -> List[Dict]:
+        """Retorna combinaciones válidas trim×motor×trans."""
+        key = make_key(brand, model)
+        return self._data.get(
+            'valid_combos', {}
+        ).get(key, [])
 
     # ══════════════════════════════════════════════════════════
     # 🆕 v6.0: Componentes de versión con descomposición on-the-fly
@@ -1141,6 +1196,8 @@ class VehicleNormalizerV4:
             'confidence_level': 'very_low',
             'version_method': None,
             'version_score': 0,
+            'motor': None,
+            'transmision_normalizada': None,
             'extracted_data': {
                 'puertas': None,
                 'traccion': None,
@@ -1228,43 +1285,6 @@ class VehicleNormalizerV4:
                 STATS.by_method.get(modelo_result['method'], 0) + 1
             )
 
-        # ═══ PASO 3.5: VALIDAR ESPECIFICIDAD ═══
-        if result['modelo'] and modelo_n and result['from_catalog']:
-            orig = normalize_key(modelo_n)
-            nuevo = result['modelo']
-            if (nuevo in orig and nuevo != orig
-                    and len(orig) > len(nuevo) + 1):
-                result['modelo'] = orig
-                result['warnings'].append(
-                    f"Modelo '{nuevo}' revertido a '{orig}' "
-                    f"(original más específico)"
-                )
-
-        if (result['modelo'] and not modelo_n and version_n
-                and result['from_catalog']):
-            vn_clean = version_n
-            if marca:
-                vn_clean = _safe_re_remove(
-                    vn_clean, normalize_key(marca))
-                vn_clean = _safe_re_remove(
-                    vn_clean,
-                    normalize_key(marca).replace('-', ' '))
-            if vn_clean:
-                nuevo = result['modelo']
-                vn_words = vn_clean.split()
-                for length in range(min(3, len(vn_words)), 0, -1):
-                    candidate = ' '.join(vn_words[:length])
-                    if (nuevo in candidate
-                            and nuevo != candidate
-                            and len(candidate) > len(nuevo) + 1):
-                        result['modelo'] = candidate
-                        result['warnings'].append(
-                            f"Modelo '{nuevo}' revertido a "
-                            f"'{candidate}' (version_raw más "
-                            f"específico)"
-                        )
-                        break
-
         # ═══════════════════════════════════════════════════
         # PASO 4: VERSIÓN — REESCRITO v6.0
         # ═══════════════════════════════════════════════════
@@ -1277,13 +1297,51 @@ class VehicleNormalizerV4:
             )
             if ver_result:
                 result['version'] = ver_result['value']
-                result['version_method'] = ver_result.get('method')
-                result['version_score'] = ver_result.get('score', 0)
+                result['version_method'] = (
+                    ver_result.get('method')
+                )
+                result['version_score'] = (
+                    ver_result.get('score', 0)
+                )
+                # Propagar motor y trans del match
+                if ver_result.get('motor'):
+                    result['motor'] = ver_result['motor']
+                if ver_result.get('trans'):
+                    result['transmision_normalizada'] = (
+                        ver_result['trans']
+                    )
+                if 'extracted' in ver_result:
+                    for k, v in (
+                        ver_result['extracted'].items()
+                    ):
+                        if v is not None:
+                            result['extracted_data'][k] = v)
                 if 'extracted' in ver_result:
                     for k, v in ver_result['extracted'].items():
                         if v is not None:
                             result['extracted_data'][k] = v
 
+        
+        # ═══ PASO 4.1: MOTOR Y TRANSMISIÓN ═══
+        if result['from_catalog'] and result['modelo']:
+            # Motor y trans se extraen del input
+            # independientemente de si se encontró versión
+            if not result.get('motor'):
+                clean_input = self._clean_version_input(
+                    version_n, marca, result['modelo']
+                )
+                user_comp = self._decompose_and_normalize(
+                    clean_input, text_all
+                )
+                if user_comp.get('motor_canonical'):
+                    result['motor'] = (
+                        user_comp['motor_canonical']
+                    )
+                if user_comp.get('trans_canonical'):
+                    result['transmision_normalizada'] = (
+                        user_comp['trans_canonical']
+                    )
+                        
         # ═══ PASO 4.5: METADATA ADICIONAL ═══
         gnc = _detect_gnc(text_all)
         if gnc is not None:
@@ -1490,74 +1548,183 @@ class VehicleNormalizerV4:
     def _find_version(self, marca, modelo, version_raw,
                       search_text) -> Optional[Dict]:
         """
-        Busca la versión con 6 estrategias escalonadas:
-        1. Match exacto completo
-        2. Component scoring (descomposición motor/trim/trans)
-        3. Token overlap (estilo v1 — busca tokens del catálogo en texto)
-        4. Trim conocido en search_text
-        5. Fuzzy sobre versiones completas
-        6. Fuzzy sobre tokens individuales
+        Busca la versión (TRIM) con estrategias escalonadas.
+        v6.1: version = trim puro, NO string completo.
+
+        Estrategias:
+          1. Trim exacto en input
+          2. Trim exacto en search_text (desc/titulo)
+          3. Match exacto de versión completa → extraer trim
+          4. Component scoring (trim+motor+trans)
+          5. Fuzzy sobre trims
         """
+        # Obtener trims y versiones
+        trims = self.catalog.get_trims(marca, modelo)
         versiones = self.catalog.get_versions(marca, modelo)
-        if not versiones:
+        combos = self.catalog.get_valid_combos(marca, modelo)
+
+        if not trims and not versiones:
             return None
 
         search_norm = normalize_text(search_text)
-        versiones_sorted = sorted(versiones, key=len, reverse=True)
 
-        # Obtener componentes (con fallback on-the-fly)
-        cat_components = self.catalog.get_version_components_safe(
-            marca, modelo)
+        # Preparar input limpio
+        clean_input = self._clean_version_input(
+            version_raw, marca, modelo
+        )
+        user_comp = self._decompose_and_normalize(
+            clean_input, search_norm
+        )
 
-        # Metadata del usuario (extraída de version_raw)
+        # Metadata extraída del usuario
         user_extracted = {
-            'puertas': None,
-            'traccion': None,
-            'carroceria': None,
-            'tiene_gnc': None,
+            'puertas': user_comp.get('puertas'),
+            'traccion': user_comp.get('traccion'),
+            'carroceria': user_comp.get('carroceria'),
+            'tiene_gnc': user_comp.get('tiene_gnc'),
         }
 
-        # ─── ESTRATEGIA 1: Match exacto completo ───
-        for v in versiones_sorted:
-            if find_exact_in_text(v, search_norm):
-                STATS.version_exact_match += 1
+        user_trim = (user_comp.get('trim') or '').lower()
+        user_motor = (
+            user_comp.get('motor_canonical') or ''
+        ).lower()
+        user_trans = (
+            user_comp.get('trans_canonical') or ''
+        ).lower()
+
+        # Guardar motor y trans en resultado
+        # independientemente del match de trim
+        motor_result = user_comp.get('motor_canonical')
+        trans_result = user_comp.get('trans_canonical')
+
+        # Ordenar trims: más largos primero
+        trims_sorted = sorted(
+            trims, key=len, reverse=True
+        )
+
+        # ─── ESTRATEGIA 1: Trim exacto en input ───
+        if user_trim:
+            for trim in trims_sorted:
+                trim_lower = trim.lower()
+                if (user_trim == trim_lower
+                        or user_trim.startswith(
+                            trim_lower + ' ')
+                        or user_trim.endswith(
+                            ' ' + trim_lower)
+                        or f' {trim_lower} ' in (
+                            f' {user_trim} ')):
+                    STATS.version_trim_match += 1
+                    return {
+                        'value': trim,
+                        'from_catalog': True,
+                        'method': 'trim_exact',
+                        'score': 95,
+                        'extracted': user_extracted,
+                        'motor': motor_result,
+                        'trans': trans_result,
+                    }
+
+        # ─── ESTRATEGIA 2: Trim en search_text ───
+        for trim in trims_sorted:
+            if len(trim) < 2:
+                continue
+            if find_exact_in_text(trim, search_norm):
+                STATS.version_trim_match += 1
                 return {
-                    'value': v,
+                    'value': trim,
                     'from_catalog': True,
-                    'method': 'exact',
-                    'score': 100,
+                    'method': 'trim_from_text',
+                    'score': 75,
                     'extracted': user_extracted,
+                    'motor': motor_result,
+                    'trans': trans_result,
                 }
 
-        # ─── Preparar input limpio para estrategias 2-6 ───
-        clean_input = self._clean_version_input(
-            version_raw, marca, modelo)
-        user_comp = self._decompose_and_normalize(
-            clean_input, search_norm)
+        # ─── ESTRATEGIA 3: Match exacto de versión
+        #     completa → extraer trim ───
+        versiones_sorted = sorted(
+            versiones, key=len, reverse=True
+        )
+        for v in versiones_sorted:
+            if find_exact_in_text(v, search_norm):
+                # Encontró versión completa,
+                # extraer el trim de ella
+                v_comp = decompose_user_input(v)
+                extracted_trim = v_comp.get('trim')
+                if extracted_trim:
+                    STATS.version_exact_match += 1
+                    return {
+                        'value': extracted_trim,
+                        'from_catalog': True,
+                        'method': 'version_exact',
+                        'score': 90,
+                        'extracted': user_extracted,
+                        'motor': (
+                            motor_result
+                            or v_comp.get('motor')
+                        ),
+                        'trans': (
+                            trans_result
+                            or v_comp.get('trans')
+                        ),
+                    }
 
-        # Capturar metadata extraída
-        user_extracted['puertas'] = user_comp.get('puertas')
-        user_extracted['traccion'] = user_comp.get('traccion')
-        user_extracted['carroceria'] = user_comp.get('carroceria')
-        user_extracted['tiene_gnc'] = user_comp.get('tiene_gnc')
+        # ─── ESTRATEGIA 4: Component scoring
+        #     (solo si hay trim en input) ───
+        if user_trim and combos:
+            best_match = None
+            best_score = 0
+            best_combo = None
 
-        has_trim = bool(user_comp.get('trim'))
-        has_motor = bool(user_comp.get('motor_canonical'))
-        has_trans = bool(user_comp.get('trans_canonical'))
-        has_any_component = has_trim or has_motor or has_trans
+            for combo in combos:
+                cat_trim = (
+                    combo.get('trim') or ''
+                ).lower()
+                cat_motor = (
+                    combo.get('motor') or ''
+                ).lower()
+                cat_trans = (
+                    combo.get('trans') or ''
+                ).lower()
 
-        # ─── ESTRATEGIA 2: Component scoring ───
-        if cat_components and has_any_component:
-            best_match, best_score = None, 0
-            for version, cc in cat_components.items():
-                score, detail = self._score_version_components(
-                    user_comp, cc)
+                score = 0
+                total_weight = 100
+
+                # Trim (60 pts)
+                if cat_trim and user_trim:
+                    if cat_trim == user_trim:
+                        score += 60
+                    elif (user_trim in cat_trim
+                          or cat_trim in user_trim):
+                        score += 45
+                    else:
+                        # Trim no matchea → skip
+                        continue
+
+                # Motor (25 pts)
+                if cat_motor and user_motor:
+                    if _motors_compatible(
+                        cat_motor, user_motor
+                    ):
+                        score += 25
+                elif not cat_motor and not user_motor:
+                    score += 10
+
+                # Trans (15 pts)
+                if cat_trans and user_trans:
+                    if _trans_compatible(
+                        cat_trans, user_trans
+                    ):
+                        score += 15
+                elif not cat_trans and not user_trans:
+                    score += 5
+
                 if score > best_score:
                     best_score = score
-                    best_match = version
+                    best_match = combo.get('trim')
+                    best_combo = combo
 
-            threshold = self._adaptive_threshold(user_comp)
-            if best_match and best_score >= threshold:
+            if best_match and best_score >= 45:
                 STATS.version_component_match += 1
                 return {
                     'value': best_match,
@@ -1565,86 +1732,31 @@ class VehicleNormalizerV4:
                     'method': 'component_match',
                     'score': best_score,
                     'extracted': user_extracted,
+                    'motor': (
+                        motor_result
+                        or (best_combo or {}).get('motor')
+                    ),
+                    'trans': (
+                        trans_result
+                        or (best_combo or {}).get('trans')
+                    ),
                 }
 
-        # ─── ESTRATEGIA 3: Token overlap (NUEVO v6.0) ───
-        token_result = self._try_token_overlap(
-            versiones_sorted, cat_components,
-            search_norm, user_comp)
-        if token_result:
-            STATS.version_token_overlap += 1
-            return {
-                'value': token_result[0],
-                'from_catalog': True,
-                'method': 'token_overlap',
-                'score': min(75, token_result[1]),
-                'extracted': user_extracted,
-            }
-
-        # ─── ESTRATEGIA 4: Trim conocido en search_text ───
-        known_trims = self.catalog.get_known_trims_safe(marca, modelo)
-        if known_trims:
-            for trim in known_trims:
-                if len(trim) < 2:
-                    continue
-                if find_exact_in_text(trim, search_norm):
-                    # Buscar versión que contenga este trim
-                    for version, cc in cat_components.items():
-                        ct = cc.get('trim', '') or ''
-                        if ct == trim or trim in ct:
-                            STATS.version_trim_match += 1
-                            return {
-                                'value': version,
-                                'from_catalog': True,
-                                'method': 'trim_from_text',
-                                'score': 55,
-                                'extracted': user_extracted,
-                            }
-                    # Fallback: buscar trim como substring de versión
-                    for v in versiones_sorted:
-                        if find_exact_in_text(trim, v):
-                            STATS.version_trim_match += 1
-                            return {
-                                'value': v,
-                                'from_catalog': True,
-                                'method': 'trim_from_text',
-                                'score': 50,
-                                'extracted': user_extracted,
-                            }
-
-        # ─── ESTRATEGIA 5: Fuzzy sobre versiones completas ───
-        if CONFIG.enable_fuzzy and clean_input and len(clean_input) >= 3:
+        # ─── ESTRATEGIA 5: Fuzzy sobre trims ───
+        if CONFIG.enable_fuzzy and user_trim and trims:
             match = fuzzy_match(
-                clean_input, versiones,
-                CONFIG.fuzzy_threshold_version)
+                user_trim, trims, 80
+            )
             if match:
                 return {
                     'value': match[0],
                     'from_catalog': True,
-                    'method': 'fuzzy',
+                    'method': 'fuzzy_trim',
                     'score': match[1],
                     'extracted': user_extracted,
+                    'motor': motor_result,
+                    'trans': trans_result,
                 }
-
-        # ─── ESTRATEGIA 6: Fuzzy sobre tokens individuales ───
-        if CONFIG.enable_fuzzy:
-            for w in search_norm.split():
-                if (len(w) >= 3
-                        and w not in FUZZY_BLACKLIST
-                        and w not in TRANS_TOKENS
-                        and w not in DRIVE_TOKENS
-                        and w not in EQUIPMENT_TOKENS):
-                    match = fuzzy_match(
-                        w, versiones,
-                        CONFIG.fuzzy_threshold_version)
-                    if match:
-                        return {
-                            'value': match[0],
-                            'from_catalog': True,
-                            'method': 'fuzzy',
-                            'score': match[1],
-                            'extracted': user_extracted,
-                        }
 
         return None
 
@@ -1905,12 +2017,16 @@ class VehicleNormalizerV4:
 
     def _adaptive_threshold(self, user_comp):
         """
-        Thresholds más bajos que v5.0 para mayor recall.
-        v5.0: 65/55/45/80 -> v6.0: 55/40/30/70
+        Thresholds para component matching.
+        v6.1: Solo transmisión → imposible matchear.
         """
         has_trim = bool(user_comp.get('trim'))
-        has_motor = bool(user_comp.get('motor_canonical'))
-        has_trans = bool(user_comp.get('trans_canonical'))
+        has_motor = bool(
+            user_comp.get('motor_canonical')
+        )
+        has_trans = bool(
+            user_comp.get('trans_canonical')
+        )
         count = sum([has_trim, has_motor, has_trans])
 
         if count >= 3:
@@ -1918,7 +2034,12 @@ class VehicleNormalizerV4:
         if count == 2:
             return 40
         if count == 1:
-            return 30 if has_trim else 25
+            if has_trim:
+                return 30
+            if has_motor:
+                return 35
+            if has_trans:
+                return 100  # No matchear solo por trans
         return 70
 
     # ─────────────────────────────────────────────
@@ -2093,6 +2214,8 @@ class VehicleNormalizerV4:
             if result['version']:
                 result['norm_status'] = 'full_match'
                 STATS.full_match += 1
+                # No necesita cambios — motor se guarda
+                # independientemente del status
             elif result['modelo']:
                 result['norm_status'] = 'partial_match'
                 STATS.partial_match += 1
@@ -2104,6 +2227,7 @@ class VehicleNormalizerV4:
                 'fallback' if result.get('modelo') else 'no_modelo'
             )
             STATS.fallback_used += 1
+            
 
 
 NORMALIZER = VehicleNormalizerV4()
