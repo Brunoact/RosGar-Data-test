@@ -1,17 +1,12 @@
 """
-🚗 Scraper RosarioGarage - Versión Producción v2.7
+🚗 Scraper RosarioGarage - Versión Producción v2.8
 ==================================================
-
-Extrae datos de cada publicación y normaliza contra catálogo.
-Si no encuentra en catálogo, usa datos originales.
-NUNCA deja marca vacía ni marca sin modelo.
-
-v2.7: Fix modelo expandido + campo motor + guardas simplificadas
-- NO expande modelo con trim (ej: "cruze ltz" → modelo="cruze")
-- Guarda motor extraído en campo separado
-- Guarda version = trim puro (ej: "ltz")
-- Guardas post-normalización simplificadas
-- Schema con columna motor
+CAMBIOS v2.8:
+- Fix: if __name__ == "__main__" (era 'if name == "main"')
+- Nuevo: tabla sold_vehicles en SCHEMA para histórico permanente
+- Nuevo: función archive_sold_vehicles() — archiva inactivos
+  antes del DELETE, con historial de precios en JSON
+- Nuevo: generación de summary.json al final de consolidate()
 """
 
 import httpx
@@ -22,6 +17,7 @@ import sys
 import sqlite3
 import glob
 import hashlib
+import json
 from datetime import datetime, date
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Tuple
@@ -61,8 +57,7 @@ WORKER_DB_PREFIX = 'rosariogarage_worker_'
 WORKER_ID = int(os.environ.get('WORKER_ID', 0))
 TOTAL_WORKERS = int(os.environ.get('TOTAL_WORKERS', 1))
 CONSOLIDATE_MODE = (
-    os.environ.get('CONSOLIDATE_MODE', 'false').lower()
-    == 'true'
+    os.environ.get('CONSOLIDATE_MODE', 'false').lower() == 'true'
 )
 WORKER_DB = f'{WORKER_DB_PREFIX}{WORKER_ID}.db'
 
@@ -94,6 +89,7 @@ class Stats:
     vehicles_updated: int = 0
     vehicles_price_changed: int = 0
     vehicles_republished: int = 0
+    vehicles_archived: int = 0
     start_time: datetime = field(default_factory=datetime.now)
 
     def rps(self) -> float:
@@ -101,8 +97,7 @@ class Stats:
             datetime.now() - self.start_time
         ).total_seconds()
         return (
-            self.requests_made / elapsed if elapsed > 0
-            else 0
+            self.requests_made / elapsed if elapsed > 0 else 0
         )
 
 
@@ -112,8 +107,7 @@ STATS = Stats()
 def setup_logging():
     logging.basicConfig(
         level=(
-            logging.INFO if not DEBUG_MODE
-            else logging.DEBUG
+            logging.INFO if not DEBUG_MODE else logging.DEBUG
         ),
         format='%(asctime)s | %(levelname)s | %(message)s',
         datefmt='%H:%M:%S',
@@ -127,7 +121,7 @@ logger = setup_logging()
 def fatal_error(msg: str, e: Exception = None):
     logger.critical(f"💀 {msg}")
     if e:
-        logger.critical(f"   {type(e).__name__}: {e}")
+        logger.critical(f"  {type(e).__name__}: {e}")
     sys.exit(1)
 
 
@@ -138,20 +132,24 @@ def fatal_error(msg: str, e: Exception = None):
 HTML_ENTITIES = str.maketrans({'\xa0': ' '})
 ENTITY_PATTERN = re.compile(r'&(\w+);')
 ENTITY_MAP = {
-    'nbsp': ' ', 'oacute': 'ó', 'aacute': 'á',
-    'eacute': 'é', 'iacute': 'í', 'uacute': 'ú',
-    'ntilde': 'ñ', 'amp': '&',
+    'nbsp': ' ',
+    'oacute': 'ó',
+    'aacute': 'á',
+    'eacute': 'é',
+    'iacute': 'í',
+    'uacute': 'ú',
+    'ntilde': 'ñ',
+    'amp': '&',
 }
-RE_DIGITS = re.compile(r'[^\d]')
-RE_PRICE = re.compile(r'(\d+\.?\d*)')
-RE_WHATSAPP = re.compile(r'wa\.me/(\d+)\?', re.I)
-RE_YEAR = re.compile(r'^(19|20)\d{2}$')
 
-RE_PUERTAS = re.compile(
-    r'\b([345])\s*[pP](?:uertas?)?\b'
-)
+RE_DIGITS = re.compile(r'[^\d]')
+RE_PRICE = re.compile(r'(\d+.?\d*)')
+RE_WHATSAPP = re.compile(r'wa.me/(\d+)?', re.I)
+RE_YEAR = re.compile(r'^(19|20)\d{2}')
+RE_PUERTAS = re.compile(r'\b([345])\s*[pP](?:uertas?)?\b')
 RE_TRACCION = re.compile(
-    r'\b(4x[24])\b|\b(AWD|FWD|RWD)\b', re.IGNORECASE
+    r'\b(4x[24])\b|\b(AWD|FWD|RWD)\b',
+    re.IGNORECASE,
 )
 RE_GNC = re.compile(
     r'\bGNC\b|\bgas\s*natural\b|\bc[/\s]?GNC\b'
@@ -159,7 +157,8 @@ RE_GNC = re.compile(
     re.IGNORECASE,
 )
 RE_0KM = re.compile(
-    r'\b0\s*km\b|\bcero\s*km\b|\bokm\b', re.IGNORECASE
+    r'\b0\s*km\b|\bcero\s*km\b|\bokm\b',
+    re.IGNORECASE,
 )
 
 
@@ -215,8 +214,11 @@ def find_worker_databases() -> List[Tuple[int, str]]:
 
 
 def generate_fingerprint(
-    marca: str, modelo: str, año: int,
-    km: int, whatsapp: str = None
+    marca: str,
+    modelo: str,
+    año: int,
+    km: int,
+    whatsapp: str = None,
 ) -> str:
     km_rango = (km // 5000) * 5000 if km else 0
     parts = [
@@ -282,8 +284,10 @@ def parse_precio(s: str, dolar: float) -> Optional[float]:
                 for x in ['U$S', 'USD', 'U$D', 'DÓLAR']
             )
             return (
-                val if is_usd
-                else round(val / dolar, 2) if dolar
+                val
+                if is_usd
+                else round(val / dolar, 2)
+                if dolar
                 else None
             )
     except Exception:
@@ -296,15 +300,15 @@ def is_particular(s: str) -> int:
         return 1
     t = s.lower()
     return (
-        1 if any(
-            x in t for x in ['due', 'particular', 'directo']
-        )
+        1
+        if any(x in t for x in ['due', 'particular', 'directo'])
         else 0
     )
 
 
 def extract_model_from_version(
-    version: str, marca: str = ""
+    version: str,
+    marca: str = "",
 ) -> str:
     if not version:
         return ""
@@ -326,38 +330,38 @@ def extract_model_from_version(
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vehicles (
-    id TEXT PRIMARY KEY,
-    url TEXT UNIQUE NOT NULL,
-    fingerprint TEXT,
-    marca TEXT,
-    modelo TEXT,
-    version TEXT,
-    año INTEGER,
-    kilometros INTEGER,
-    motor TEXT,
-    transmision TEXT,
-    combustible TEXT,
-    precio_usd REAL,
-    es_particular INTEGER DEFAULT 1,
-    avisos_vendedor INTEGER DEFAULT 1,
-    whatsapp TEXT,
-    ciudad TEXT,
-    provincia TEXT,
-    visitas INTEGER,
-    expira_dias INTEGER,
-    tiene_urgencia INTEGER DEFAULT 0,
-    primera_vista DATE NOT NULL,
-    ultima_vista DATE NOT NULL,
-    activo INTEGER DEFAULT 1,
-    dias_publicado INTEGER DEFAULT 0,
-    norm_status TEXT DEFAULT 'pending',
-    puertas INTEGER,
-    traccion TEXT,
-    tiene_gnc INTEGER DEFAULT 0,
-    es_0km INTEGER DEFAULT 0,
-    version_raw TEXT,
-    descripcion TEXT,
-    norm_confidence INTEGER DEFAULT 0
+    id               TEXT PRIMARY KEY,
+    url              TEXT UNIQUE NOT NULL,
+    fingerprint      TEXT,
+    marca            TEXT,
+    modelo           TEXT,
+    version          TEXT,
+    año              INTEGER,
+    kilometros       INTEGER,
+    motor            TEXT,
+    transmision      TEXT,
+    combustible      TEXT,
+    precio_usd       REAL,
+    es_particular    INTEGER DEFAULT 1,
+    avisos_vendedor  INTEGER DEFAULT 1,
+    whatsapp         TEXT,
+    ciudad           TEXT,
+    provincia        TEXT,
+    visitas          INTEGER,
+    expira_dias      INTEGER,
+    tiene_urgencia   INTEGER DEFAULT 0,
+    primera_vista    DATE NOT NULL,
+    ultima_vista     DATE NOT NULL,
+    activo           INTEGER DEFAULT 1,
+    dias_publicado   INTEGER DEFAULT 0,
+    norm_status      TEXT DEFAULT 'pending',
+    puertas          INTEGER,
+    traccion         TEXT,
+    tiene_gnc        INTEGER DEFAULT 0,
+    es_0km           INTEGER DEFAULT 0,
+    version_raw      TEXT,
+    descripcion      TEXT,
+    norm_confidence  INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_activo
@@ -374,35 +378,73 @@ CREATE INDEX IF NOT EXISTS idx_norm_status
     ON vehicles(norm_status);
 
 CREATE TABLE IF NOT EXISTS price_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vehicle_id TEXT NOT NULL,
-    precio_usd REAL,
-    fecha DATE NOT NULL,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    vehicle_id  TEXT NOT NULL,
+    precio_usd  REAL,
+    fecha       DATE NOT NULL,
     variacion_pct REAL,
     FOREIGN KEY (vehicle_id)
-        REFERENCES vehicles(id) ON DELETE CASCADE
+        REFERENCES vehicles(id)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_vehicle
     ON price_history(vehicle_id);
 
 CREATE TABLE IF NOT EXISTS scrape_metadata (
-    key TEXT PRIMARY KEY,
+    key   TEXT PRIMARY KEY,
     value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS republication_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT NOT NULL,
-    old_vehicle_id TEXT,
-    new_vehicle_id TEXT,
-    fecha DATE NOT NULL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint     TEXT NOT NULL,
+    old_vehicle_id  TEXT,
+    new_vehicle_id  TEXT,
+    fecha           DATE NOT NULL,
     dias_acumulados INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS sold_vehicles (
+    id                      TEXT PRIMARY KEY,
+    marca                   TEXT,
+    modelo                  TEXT,
+    version                 TEXT,
+    año                     INTEGER,
+    kilometros              INTEGER,
+    motor                   TEXT,
+    transmision             TEXT,
+    combustible             TEXT,
+    ciudad                  TEXT,
+    provincia               TEXT,
+    whatsapp                TEXT,
+    es_particular           INTEGER DEFAULT 1,
+    precio_inicial_usd      REAL,
+    precio_final_usd        REAL,
+    cantidad_cambios_precio INTEGER DEFAULT 0,
+    primera_vista           DATE,
+    ultima_vista            DATE,
+    dias_en_mercado         INTEGER DEFAULT 0,
+    tiene_gnc               INTEGER DEFAULT 0,
+    es_0km                  INTEGER DEFAULT 0,
+    puertas                 INTEGER,
+    traccion                TEXT,
+    norm_status             TEXT,
+    norm_confidence         INTEGER DEFAULT 0,
+    historial_precios_json  TEXT,
+    fecha_archivo           DATE NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sold_marca_modelo
+    ON sold_vehicles(marca, modelo);
+CREATE INDEX IF NOT EXISTS idx_sold_fecha
+    ON sold_vehicles(fecha_archivo);
+CREATE INDEX IF NOT EXISTS idx_sold_ultima_vista
+    ON sold_vehicles(ultima_vista);
 """
 
 
-def _ensure_columns_sync(conn):
+def ensure_columns_sync(conn):
     cursor = conn.execute("PRAGMA table_info(vehicles)")
     existing = {row[1] for row in cursor.fetchall()}
     new_cols = {
@@ -462,11 +504,14 @@ class HTTPClient:
         timeout = httpx.Timeout(
             connect=CONFIG.connect_timeout,
             read=CONFIG.read_timeout,
-            write=10, pool=5,
+            write=10,
+            pool=5,
         )
         self.client = httpx.AsyncClient(
-            limits=limits, timeout=timeout,
-            follow_redirects=True, http2=True,
+            limits=limits,
+            timeout=timeout,
+            follow_redirects=True,
+            http2=True,
         )
         self.sem_list = asyncio.Semaphore(
             CONFIG.max_concurrent_listings
@@ -477,12 +522,14 @@ class HTTPClient:
         logger.info("🌐 HTTP Client listo")
         return self
 
-    async def __aexit__(self, *_):
+    async def __aexit__(self, *args):
         if self.client:
             await self.client.aclose()
 
     async def fetch(
-        self, url: str, sem: asyncio.Semaphore
+        self,
+        url: str,
+        sem: asyncio.Semaphore,
     ) -> Optional[httpx.Response]:
         async with sem:
             for attempt in range(CONFIG.max_retries):
@@ -575,7 +622,8 @@ def parse_listing_item(div) -> Optional[Dict]:
 
 
 async def fetch_listing_page(
-    http: HTTPClient, offset: int
+    http: HTTPClient,
+    offset: int,
 ) -> List[Dict]:
     r = await http.fetch_listing(
         f"{LISTING_URL}&o={offset}"
@@ -587,7 +635,8 @@ async def fetch_listing_page(
             decode_response(r), 'html.parser'
         )
         return [
-            v for d in soup.select('div[data-rel]')
+            v
+            for d in soup.select('div[data-rel]')
             if (v := parse_listing_item(d))
         ]
     except Exception:
@@ -599,28 +648,21 @@ async def fetch_listings(http: HTTPClient) -> List[Dict]:
     logger.info(
         f"🔀 Worker {WORKER_ID}: Páginas {start}-{end}"
     )
-
     vehicles = []
     seen = set()
     offsets = [
-        p * ITEMS_PER_PAGE for p in range(start, end + 1)
+        p * ITEMS_PER_PAGE
+        for p in range(start, end + 1)
     ]
     empty = 0
-
     for i in range(
         0, len(offsets), CONFIG.max_concurrent_listings
     ):
-        batch = offsets[
-            i:i + CONFIG.max_concurrent_listings
-        ]
+        batch = offsets[i:i + CONFIG.max_concurrent_listings]
         results = await asyncio.gather(
-            *[
-                fetch_listing_page(http, o)
-                for o in batch
-            ],
+            *[fetch_listing_page(http, o) for o in batch],
             return_exceptions=True,
         )
-
         new = 0
         all_empty = True
         for res in results:
@@ -633,20 +675,15 @@ async def fetch_listings(http: HTTPClient) -> List[Dict]:
                         seen.add(v['id'])
                         vehicles.append(v)
                         new += 1
-
         if all_empty:
             empty += 1
             if empty >= 2:
                 break
         else:
             empty = 0
-
         logger.info(f"  +{new} | Total: {len(vehicles)}")
         if CONFIG.delay_between_batches > 0:
-            await asyncio.sleep(
-                CONFIG.delay_between_batches
-            )
-
+            await asyncio.sleep(CONFIG.delay_between_batches)
     if not vehicles:
         fatal_error(f"Worker {WORKER_ID}: Sin vehículos")
     return vehicles
@@ -718,9 +755,7 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
             break
 
     if desc_box:
-        data['marca_raw'] = extract_field(
-            desc_box, 'Marca'
-        )
+        data['marca_raw'] = extract_field(desc_box, 'Marca')
 
         version_span_raw = None
         for span in desc_box.find_all('span'):
@@ -734,16 +769,12 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
 
         if version_span_raw:
             data['version_raw_original'] = version_span_raw
-            data['version_raw'] = clean_text(
-                version_span_raw
-            )
+            data['version_raw'] = clean_text(version_span_raw)
         else:
             data['version_raw'] = extract_field(
                 desc_box, 'Versi'
             )
-            data['version_raw_original'] = (
-                data['version_raw']
-            )
+            data['version_raw_original'] = data['version_raw']
 
         data['año'] = parse_year(
             extract_field(desc_box, 'Año')
@@ -873,7 +904,9 @@ def extract_raw_data(soup: BeautifulSoup) -> Dict:
 
 
 async def fetch_vehicle_details(
-    http: HTTPClient, basic: Dict, dolar: float
+    http: HTTPClient,
+    basic: Dict,
+    dolar: float,
 ) -> Optional[Dict]:
     url = basic.get('url', '')
     if not url:
@@ -952,19 +985,20 @@ async def fetch_vehicle_details(
         titulo = (raw.get('titulo') or '').strip()
         descripcion = raw.get('descripcion') or ''
 
-        # Pre-limpieza: quitar marca de version_raw
         version_for_norm = version_raw
         if marca_raw and version_for_norm:
             version_for_norm = re.sub(
                 r'\b' + re.escape(marca_raw) + r'\b',
-                '', version_for_norm,
+                '',
+                version_for_norm,
                 flags=re.IGNORECASE,
             ).strip()
             marca_nohyphen = marca_raw.replace('-', ' ')
             if marca_nohyphen != marca_raw:
                 version_for_norm = re.sub(
                     r'\b' + re.escape(marca_nohyphen) + r'\b',
-                    '', version_for_norm,
+                    '',
+                    version_for_norm,
                     flags=re.IGNORECASE,
                 ).strip()
 
@@ -980,7 +1014,6 @@ async def fetch_vehicle_details(
                     km_raw=raw['kilometros'],
                     precio_raw=result['precio_usd'],
                 )
-
                 result['marca'] = norm.get('marca')
                 result['modelo'] = norm.get('modelo')
                 result['version'] = norm.get('version')
@@ -992,50 +1025,52 @@ async def fetch_vehicle_details(
                     'confidence', 0
                 )
 
-                # Año corregido
                 año_det = norm.get('año_detectado')
-                if (año_det
-                        and norm.get('año_fuente') in (
-                            'description', 'title', 'text'
-                        )
-                        and result['año'] != año_det):
+                if (
+                    año_det
+                    and norm.get('año_fuente') in (
+                        'description', 'title', 'text'
+                    )
+                    and result['año'] != año_det
+                ):
                     result['año'] = año_det
 
-                # Metadata del normalizer
                 extracted = norm.get('extracted_data', {})
-                if (extracted.get('puertas')
-                        and not result['puertas']):
+                if (
+                    extracted.get('puertas')
+                    and not result['puertas']
+                ):
                     result['puertas'] = extracted['puertas']
-                if (extracted.get('traccion')
-                        and not result['traccion']):
+                if (
+                    extracted.get('traccion')
+                    and not result['traccion']
+                ):
                     result['traccion'] = extracted['traccion']
-                if (extracted.get('tiene_gnc')
-                        and not result['tiene_gnc']):
+                if (
+                    extracted.get('tiene_gnc')
+                    and not result['tiene_gnc']
+                ):
                     result['tiene_gnc'] = 1
-                if (extracted.get('es_0km')
-                        and not result['es_0km']):
+                if (
+                    extracted.get('es_0km')
+                    and not result['es_0km']
+                ):
                     result['es_0km'] = 1
 
-                # Transmisión normalizada
-                trans_norm = norm.get(
-                    'transmision_normalizada'
-                )
+                trans_norm = norm.get('transmision_normalizada')
                 if trans_norm and not result['transmision']:
                     if trans_norm in ('at', 'cvt', 'dsg', 'amt'):
                         result['transmision'] = 'automatico'
                     elif trans_norm == 'mt':
                         result['transmision'] = 'manual'
 
-                # ═══════════════════════════════════════
-                # 🛡️ GUARDA: No asignar versión sin input
-                # ═══════════════════════════════════════
-                if (result['version']
-                        and not version_raw.strip()):
+                if (
+                    result['version']
+                    and not version_raw.strip()
+                ):
                     result['version'] = None
-                    if result['norm_status'] == 'full_match':
-                        result['norm_status'] = (
-                            'partial_match'
-                        )
+                if result['norm_status'] == 'full_match':
+                    result['norm_status'] = 'partial_match'
 
                 if DEBUG_MODE:
                     if norm.get('warnings'):
@@ -1043,7 +1078,6 @@ async def fetch_vehicle_details(
                             logger.debug(
                                 f"  ⚠️ {basic['id']}: {w}"
                             )
-
             except Exception as e:
                 result['norm_status'] = 'error'
                 if DEBUG_MODE:
@@ -1052,9 +1086,7 @@ async def fetch_vehicle_details(
                         f"{basic['id']}: {e}"
                     )
 
-        # ═══════════════════════════════════════════════════
         # FALLBACK
-        # ═══════════════════════════════════════════════════
         if not result['marca']:
             result['marca'] = (
                 marca_raw.lower() if marca_raw else None
@@ -1074,14 +1106,18 @@ async def fetch_vehicle_details(
                 )
             result['modelo'] = model if model else None
 
-        if (result['marca']
-                and not result['modelo']
-                and version_raw):
+        if (
+            result['marca']
+            and not result['modelo']
+            and version_raw
+        ):
             words = version_raw.lower().split()
             for w in words:
-                if (len(w) >= 2
-                        and not RE_YEAR.match(w)
-                        and w != result['marca']):
+                if (
+                    len(w) >= 2
+                    and not RE_YEAR.match(w)
+                    and w != result['marca']
+                ):
                     result['modelo'] = w
                     break
 
@@ -1097,11 +1133,12 @@ async def fetch_vehicle_details(
 
         # Fingerprint
         result['fingerprint'] = generate_fingerprint(
-            result['marca'], result['modelo'],
-            result['año'], result['kilometros'],
+            result['marca'],
+            result['modelo'],
+            result['año'],
+            result['kilometros'],
             result['whatsapp'],
         )
-
         return result
 
     except Exception as e:
@@ -1111,14 +1148,15 @@ async def fetch_vehicle_details(
 
 
 async def fetch_all_details(
-    http: HTTPClient, vehicles: List[Dict], dolar: float
+    http: HTTPClient,
+    vehicles: List[Dict],
+    dolar: float,
 ) -> List[Dict]:
     total = len(vehicles)
     logger.info(
         f"🚗 Extrayendo detalles de {total} vehículos..."
     )
     results = []
-
     for i in range(0, total, CONFIG.batch_size):
         batch = vehicles[i:i + CONFIG.batch_size]
         batch_results = await asyncio.gather(
@@ -1132,9 +1170,7 @@ async def fetch_all_details(
             if r and not isinstance(r, Exception):
                 results.append(r)
 
-        with_marca = sum(
-            1 for x in results if x.get('marca')
-        )
+        with_marca = sum(1 for x in results if x.get('marca'))
         with_modelo = sum(
             1 for x in results
             if x.get('marca') and x.get('modelo')
@@ -1145,9 +1181,7 @@ async def fetch_all_details(
             f"Marca: {with_marca} | Modelo: {with_modelo}"
         )
         if CONFIG.delay_between_batches > 0:
-            await asyncio.sleep(
-                CONFIG.delay_between_batches
-            )
+            await asyncio.sleep(CONFIG.delay_between_batches)
 
     if not results:
         fatal_error("No se procesó ningún vehículo")
@@ -1159,7 +1193,8 @@ async def fetch_all_details(
 # ═══════════════════════════════════════════════════════════════
 
 async def save_worker_results(
-    results: List[Dict], dolar: float
+    results: List[Dict],
+    dolar: float,
 ):
     today = date.today().isoformat()
     with_marca = sum(1 for v in results if v.get('marca'))
@@ -1177,7 +1212,6 @@ async def save_worker_results(
     )
 
     await init_worker_db(WORKER_DB)
-
     async with aiosqlite.connect(WORKER_DB) as db:
         for k, val in [
             ('scrape_date', today),
@@ -1191,57 +1225,250 @@ async def save_worker_results(
         ]:
             await db.execute(
                 "INSERT OR REPLACE INTO scrape_metadata "
-                "VALUES (?, ?)", (k, val)
+                "VALUES (?, ?)",
+                (k, val),
             )
 
         for v in results:
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT OR REPLACE INTO vehicles (
                     id, url, fingerprint,
                     marca, modelo, version,
-                    año, kilometros,
-                    motor, transmision, combustible,
-                    precio_usd,
-                    es_particular, avisos_vendedor,
-                    whatsapp, ciudad, provincia,
-                    visitas, expira_dias, tiene_urgencia,
+                    año, kilometros, motor,
+                    transmision, combustible,
+                    precio_usd, es_particular,
+                    avisos_vendedor, whatsapp,
+                    ciudad, provincia,
+                    visitas, expira_dias,
+                    tiene_urgencia,
                     primera_vista, ultima_vista,
                     activo, norm_status,
-                    puertas, traccion, tiene_gnc, es_0km,
+                    puertas, traccion,
+                    tiene_gnc, es_0km,
                     version_raw, descripcion,
                     norm_confidence
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, 1, ?,
-                    ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?
                 )
-            """, (
-                v['id'], v['url'], v['fingerprint'],
-                v['marca'], v['modelo'], v['version'],
-                v['año'], v['kilometros'],
-                v.get('motor'), v['transmision'],
-                v['combustible'],
-                v['precio_usd'],
-                v['es_particular'], v['avisos_vendedor'],
-                v['whatsapp'], v['ciudad'], v['provincia'],
-                v['visitas'], v['expira_dias'],
-                v['tiene_urgencia'],
-                today, today,
-                v['norm_status'],
-                v.get('puertas'), v.get('traccion'),
-                v.get('tiene_gnc', 0), v.get('es_0km', 0),
-                v.get('version_raw'), v.get('descripcion'),
-                v.get('norm_confidence', 0),
-            ))
-
+                """,
+                (
+                    v['id'], v['url'], v['fingerprint'],
+                    v['marca'], v['modelo'], v['version'],
+                    v['año'], v['kilometros'], v.get('motor'),
+                    v['transmision'], v['combustible'],
+                    v['precio_usd'], v['es_particular'],
+                    v['avisos_vendedor'], v['whatsapp'],
+                    v['ciudad'], v['provincia'],
+                    v['visitas'], v['expira_dias'],
+                    v['tiene_urgencia'],
+                    today, today,
+                    v['norm_status'],
+                    v.get('puertas'), v.get('traccion'),
+                    v.get('tiene_gnc', 0),
+                    v.get('es_0km', 0),
+                    v.get('version_raw'),
+                    v.get('descripcion'),
+                    v.get('norm_confidence', 0),
+                ),
+            )
         await db.commit()
 
     logger.info(f"✅ Guardados {len(results)} vehículos")
     logger.info(
-        f"   📊 Marca: {with_marca} | Modelo: {with_modelo}"
+        f"  📊 Marca: {with_marca} | Modelo: {with_modelo}"
         f" | Full: {full} | Partial: {partial}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🗃️ ARCHIVO DE VEHÍCULOS INACTIVOS
+# ═══════════════════════════════════════════════════════════════
+
+def archive_sold_vehicles(
+    conn: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+    today: str,
+) -> int:
+    """
+    Archiva en sold_vehicles todos los registros con
+    activo=0 y ultima_vista <= 89 días atrás, antes
+    de que el DELETE los elimine con CASCADE.
+
+    Captura el historial de precios completo en JSON.
+    Usa INSERT OR IGNORE para ser idempotente.
+
+    Retorna la cantidad de registros archivados.
+    """
+    candidates = cursor.execute(
+        """
+        SELECT
+            v.id, v.marca, v.modelo, v.version,
+            v.año, v.kilometros, v.motor,
+            v.transmision, v.combustible,
+            v.ciudad, v.provincia, v.whatsapp,
+            v.es_particular, v.precio_usd,
+            v.primera_vista, v.ultima_vista,
+            v.dias_publicado, v.tiene_gnc,
+            v.es_0km, v.puertas, v.traccion,
+            v.norm_status, v.norm_confidence
+        FROM vehicles v
+        WHERE v.activo = 0
+          AND v.ultima_vista <= date('now', '-89 days')
+          AND v.id NOT IN (SELECT id FROM sold_vehicles)
+        """
+    ).fetchall()
+
+    if not candidates:
+        return 0
+
+    archived = 0
+    for row in candidates:
+        vid = row[0]
+
+        # Obtener historial de precios
+        history_rows = cursor.execute(
+            """
+            SELECT precio_usd, fecha, variacion_pct
+            FROM price_history
+            WHERE vehicle_id = ?
+            ORDER BY fecha ASC
+            """,
+            (vid,),
+        ).fetchall()
+
+        history_list = [
+            {
+                'precio_usd': h[0],
+                'fecha': h[1],
+                'variacion_pct': h[2],
+            }
+            for h in history_rows
+        ]
+
+        precio_inicial = (
+            history_list[0]['precio_usd']
+            if history_list
+            else None
+        )
+        precio_final = row[13]  # precio_usd actual
+        cantidad_cambios = max(0, len(history_list) - 1)
+        dias_en_mercado = row[16] or 0
+
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO sold_vehicles (
+                    id, marca, modelo, version,
+                    año, kilometros, motor,
+                    transmision, combustible,
+                    ciudad, provincia, whatsapp,
+                    es_particular,
+                    precio_inicial_usd, precio_final_usd,
+                    cantidad_cambios_precio,
+                    primera_vista, ultima_vista,
+                    dias_en_mercado,
+                    tiene_gnc, es_0km,
+                    puertas, traccion,
+                    norm_status, norm_confidence,
+                    historial_precios_json,
+                    fecha_archivo
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    row[0],   # id
+                    row[1],   # marca
+                    row[2],   # modelo
+                    row[3],   # version
+                    row[4],   # año
+                    row[5],   # kilometros
+                    row[6],   # motor
+                    row[7],   # transmision
+                    row[8],   # combustible
+                    row[9],   # ciudad
+                    row[10],  # provincia
+                    row[11],  # whatsapp
+                    row[12],  # es_particular
+                    precio_inicial,
+                    precio_final,
+                    cantidad_cambios,
+                    row[14],  # primera_vista
+                    row[15],  # ultima_vista
+                    dias_en_mercado,
+                    row[17],  # tiene_gnc
+                    row[18],  # es_0km
+                    row[19],  # puertas
+                    row[20],  # traccion
+                    row[21],  # norm_status
+                    row[22],  # norm_confidence
+                    json.dumps(history_list),
+                    today,
+                ),
+            )
+            archived += 1
+        except sqlite3.Error as e:
+            logger.warning(
+                f"  ⚠️ Error archivando {vid}: {e}"
+            )
+
+    conn.commit()
+    return archived
+
+
+# ═══════════════════════════════════════════════════════════════
+# 📄 SUMMARY JSON
+# ═══════════════════════════════════════════════════════════════
+
+def write_summary_json(
+    conn: sqlite3.Connection,
+    nuevos: int,
+    archivados: int,
+):
+    """
+    Genera summary.json con las métricas que el
+    paso 'Resumen' del workflow lee con jq.
+    """
+    try:
+        activos = conn.execute(
+            "SELECT COUNT(*) FROM vehicles WHERE activo = 1"
+        ).fetchone()[0]
+
+        full_match = conn.execute(
+            "SELECT COUNT(*) FROM vehicles "
+            "WHERE activo = 1 AND norm_status = 'full_match'"
+        ).fetchone()[0]
+
+        partial_match = conn.execute(
+            "SELECT COUNT(*) FROM vehicles "
+            "WHERE activo = 1 "
+            "AND norm_status = 'partial_match'"
+        ).fetchone()[0]
+
+        total_sold = conn.execute(
+            "SELECT COUNT(*) FROM sold_vehicles"
+        ).fetchone()[0]
+
+        summary = {
+            'activos': activos,
+            'nuevos_hoy': nuevos,
+            'normalizados': full_match,
+            'parciales': partial_match,
+            'archivados_hoy': archivados,
+            'total_historico': total_sold,
+        }
+
+        with open('summary.json', 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
+
+        logger.info(f"📄 summary.json generado: {summary}")
+    except Exception as e:
+        logger.warning(f"  ⚠️ No se pudo generar summary.json: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1249,7 +1476,7 @@ async def save_worker_results(
 # ═══════════════════════════════════════════════════════════════
 
 def read_worker_data(
-    path: str
+    path: str,
 ) -> Tuple[List[tuple], Dict]:
     vehicles, metadata = [], {}
     try:
@@ -1260,21 +1487,22 @@ def read_worker_data(
         ):
             metadata[row['key']] = row['value']
 
-        cursor = conn.execute("""
-            SELECT id, url, fingerprint,
-                   marca, modelo, version,
-                   año, kilometros,
-                   motor, transmision, combustible,
-                   precio_usd,
-                   es_particular, avisos_vendedor,
-                   whatsapp, ciudad, provincia,
-                   visitas, expira_dias, tiene_urgencia,
-                   norm_status,
-                   puertas, traccion, tiene_gnc, es_0km,
-                   version_raw, descripcion,
-                   norm_confidence
+        cursor = conn.execute(
+            """
+            SELECT
+                id, url, fingerprint,
+                marca, modelo, version,
+                año, kilometros, motor,
+                transmision, combustible, precio_usd,
+                es_particular, avisos_vendedor,
+                whatsapp, ciudad, provincia,
+                visitas, expira_dias, tiene_urgencia,
+                norm_status, puertas, traccion,
+                tiene_gnc, es_0km, version_raw,
+                descripcion, norm_confidence
             FROM vehicles
-        """)
+            """
+        )
         vehicles = [tuple(row) for row in cursor]
         conn.close()
     except Exception as e:
@@ -1299,7 +1527,10 @@ def consolidate():
     all_data = []
     dolar = None
     stats = {
-        'marca': 0, 'modelo': 0, 'full': 0, 'partial': 0,
+        'marca': 0,
+        'modelo': 0,
+        'full': 0,
+        'partial': 0,
     }
 
     for wid, path in workers:
@@ -1307,23 +1538,19 @@ def consolidate():
         if vehicles:
             all_data.append((wid, vehicles, meta))
             m = sum(1 for v in vehicles if v[3])
-            mo = sum(1 for v in vehicles if v[3] and v[4])
+            mo = sum(
+                1 for v in vehicles if v[3] and v[4]
+            )
             logger.info(
-                f"   Worker {wid}: {len(vehicles)} "
+                f"  Worker {wid}: {len(vehicles)} "
                 f"(marca: {m}, modelo: {mo})"
             )
-            if not dolar and 'dolar_mep' in meta:
-                dolar = float(meta['dolar_mep'])
-            stats['marca'] += int(
-                meta.get('with_marca', 0)
-            )
-            stats['modelo'] += int(
-                meta.get('with_modelo', 0)
-            )
-            stats['full'] += int(meta.get('norm_full', 0))
-            stats['partial'] += int(
-                meta.get('norm_partial', 0)
-            )
+        if not dolar and 'dolar_mep' in meta:
+            dolar = float(meta['dolar_mep'])
+        stats['marca'] += int(meta.get('with_marca', 0))
+        stats['modelo'] += int(meta.get('with_modelo', 0))
+        stats['full'] += int(meta.get('norm_full', 0))
+        stats['partial'] += int(meta.get('norm_partial', 0))
 
     if not all_data or not dolar:
         fatal_error("Sin datos")
@@ -1337,9 +1564,9 @@ def consolidate():
 
     init_master_db(MASTER_DB)
     conn = sqlite3.connect(MASTER_DB)
-    _ensure_columns_sync(conn)
+    ensure_columns_sync(conn)
 
-    # Reparar datos corruptos
+    # Reparar datos corruptos previos
     conn.execute(
         "UPDATE vehicles SET ultima_vista = primera_vista "
         "WHERE ultima_vista NOT LIKE '____-__-__'"
@@ -1351,6 +1578,7 @@ def consolidate():
     conn.commit()
 
     cursor = conn.cursor()
+
     cursor.execute(
         "INSERT OR REPLACE INTO scrape_metadata "
         "VALUES (?, ?)",
@@ -1378,10 +1606,11 @@ def consolidate():
     # 17=visitas, 18=expira_dias, 19=tiene_urgencia,
     # 20=norm_status,
     # 21=puertas, 22=traccion, 23=tiene_gnc, 24=es_0km,
-    # 25=version_raw, 26=descripcion,
-    # 27=norm_confidence
+    # 25=version_raw, 26=descripcion, 27=norm_confidence
 
     seen = set()
+    nuevos_hoy = 0
+
     for wid, vehicles, _ in all_data:
         for v in vehicles:
             vid = v[0]
@@ -1396,13 +1625,13 @@ def consolidate():
 
             if existing:
                 old_precio = existing[0]
-                cursor.execute("""
+                cursor.execute(
+                    """
                     UPDATE vehicles SET
                         url=?, fingerprint=?,
                         marca=?, modelo=?, version=?,
-                        año=?, kilometros=?,
-                        motor=?, transmision=?,
-                        combustible=?,
+                        año=?, kilometros=?, motor=?,
+                        transmision=?, combustible=?,
                         precio_usd=?,
                         es_particular=?, avisos_vendedor=?,
                         whatsapp=?, ciudad=?, provincia=?,
@@ -1410,35 +1639,42 @@ def consolidate():
                         tiene_urgencia=?,
                         ultima_vista=?, activo=1,
                         dias_publicado=julianday(?)
-                            -julianday(primera_vista),
+                            - julianday(primera_vista),
                         norm_status=?,
                         puertas=?, traccion=?,
                         tiene_gnc=?, es_0km=?,
                         version_raw=?, descripcion=?,
                         norm_confidence=?
                     WHERE id=?
-                """, (
-                    v[1], v[2],
-                    v[3], v[4], v[5],
-                    v[6], v[7],
-                    v[8], v[9], v[10],
-                    v[11],
-                    v[12], v[13],
-                    v[14], v[15], v[16],
-                    v[17], v[18], v[19],
-                    today, today,
-                    v[20],
-                    v[21], v[22], v[23], v[24],
-                    v[25], v[26], v[27],
-                    vid,
-                ))
+                    """,
+                    (
+                        v[1], v[2],
+                        v[3], v[4], v[5],
+                        v[6], v[7], v[8],
+                        v[9], v[10],
+                        v[11],
+                        v[12], v[13],
+                        v[14], v[15], v[16],
+                        v[17], v[18],
+                        v[19],
+                        today, today,
+                        v[20],
+                        v[21], v[22],
+                        v[23], v[24],
+                        v[25], v[26],
+                        v[27],
+                        vid,
+                    ),
+                )
                 STATS.vehicles_updated += 1
 
-                if (old_precio and precio
-                        and abs(old_precio - precio) > 0.01):
+                if (
+                    old_precio
+                    and precio
+                    and abs(old_precio - precio) > 0.01
+                ):
                     var = (
-                        (precio - old_precio)
-                        / old_precio
+                        (precio - old_precio) / old_precio
                     ) * 100
                     cursor.execute(
                         "INSERT INTO price_history "
@@ -1447,15 +1683,16 @@ def consolidate():
                     )
                     STATS.vehicles_price_changed += 1
             else:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO vehicles (
                         id, url, fingerprint,
                         marca, modelo, version,
-                        año, kilometros,
-                        motor, transmision, combustible,
-                        precio_usd,
-                        es_particular, avisos_vendedor,
-                        whatsapp, ciudad, provincia,
+                        año, kilometros, motor,
+                        transmision, combustible,
+                        precio_usd, es_particular,
+                        avisos_vendedor, whatsapp,
+                        ciudad, provincia,
                         visitas, expira_dias,
                         tiene_urgencia,
                         primera_vista, ultima_vista,
@@ -1466,25 +1703,29 @@ def consolidate():
                         version_raw, descripcion,
                         norm_confidence
                     ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, 1, 0,
-                        ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?
                     )
-                """, (
-                    v[0], v[1], v[2],
-                    v[3], v[4], v[5],
-                    v[6], v[7],
-                    v[8], v[9], v[10],
-                    v[11],
-                    v[12], v[13],
-                    v[14], v[15], v[16],
-                    v[17], v[18], v[19],
-                    today, today,
-                    v[20],
-                    v[21], v[22], v[23], v[24],
-                    v[25], v[26], v[27],
-                ))
+                    """,
+                    (
+                        v[0], v[1], v[2],
+                        v[3], v[4], v[5],
+                        v[6], v[7], v[8],
+                        v[9], v[10],
+                        v[11], v[12],
+                        v[13], v[14],
+                        v[15], v[16],
+                        v[17], v[18],
+                        v[19],
+                        today, today,
+                        v[20],
+                        v[21], v[22],
+                        v[23], v[24],
+                        v[25], v[26],
+                        v[27],
+                    ),
+                )
                 if precio:
                     cursor.execute(
                         "INSERT INTO price_history "
@@ -1492,7 +1733,9 @@ def consolidate():
                         (vid, precio, today),
                     )
                 STATS.vehicles_new += 1
+                nuevos_hoy += 1
 
+    # Marcar inactivos
     if seen:
         ph = ','.join('?' * len(seen))
         cursor.execute(
@@ -1501,35 +1744,59 @@ def consolidate():
             tuple(seen),
         )
 
+    conn.commit()
+
+    # ── ARCHIVAR ANTES DEL DELETE ──────────────────────────
+    logger.info("\n🗃️ Archivando vehículos inactivos...")
+    archivados = archive_sold_vehicles(conn, cursor, today)
+    STATS.vehicles_archived = archivados
+    logger.info(f"  ✅ Archivados: {archivados}")
+
+    # ── DELETE (después del archivo) ───────────────────────
     cursor.execute(
-        "DELETE FROM price_history WHERE vehicle_id IN "
-        "(SELECT id FROM vehicles WHERE activo=0 "
-        "AND ultima_vista < date('now', '-90 days'))"
+        "DELETE FROM price_history WHERE vehicle_id IN ("
+        "  SELECT id FROM vehicles"
+        "  WHERE activo=0"
+        "  AND ultima_vista < date('now', '-90 days')"
+        ")"
     )
     cursor.execute(
         "DELETE FROM vehicles WHERE activo=0 "
         "AND ultima_vista < date('now', '-90 days')"
     )
 
+    # ── ESTADÍSTICAS FINALES ───────────────────────────────
     active = cursor.execute(
         "SELECT COUNT(*) FROM vehicles WHERE activo=1"
     ).fetchone()[0]
+
     with_marca = cursor.execute(
         "SELECT COUNT(*) FROM vehicles "
         "WHERE activo=1 AND marca IS NOT NULL"
     ).fetchone()[0]
+
     with_modelo = cursor.execute(
         "SELECT COUNT(*) FROM vehicles "
         "WHERE activo=1 AND marca IS NOT NULL "
         "AND modelo IS NOT NULL"
     ).fetchone()[0]
+
     history = cursor.execute(
         "SELECT COUNT(*) FROM price_history"
     ).fetchone()[0]
 
+    total_sold = cursor.execute(
+        "SELECT COUNT(*) FROM sold_vehicles"
+    ).fetchone()[0]
+
     conn.commit()
+
+    # Generar summary.json para el workflow
+    write_summary_json(conn, nuevos_hoy, archivados)
+
     conn.close()
 
+    # Limpiar worker DBs
     for _, path in workers:
         try:
             os.remove(path)
@@ -1539,19 +1806,25 @@ def consolidate():
     logger.info("\n" + "=" * 60)
     logger.info("✅ CONSOLIDACIÓN COMPLETADA")
     logger.info("=" * 60)
-    logger.info(f"   🆕 Nuevos: {STATS.vehicles_new}")
+    logger.info(f"  🆕 Nuevos: {STATS.vehicles_new}")
     logger.info(
-        f"   🔄 Actualizados: {STATS.vehicles_updated}"
+        f"  🔄 Actualizados: {STATS.vehicles_updated}"
     )
     logger.info(
-        f"   💰 Cambios precio: "
+        f"  💰 Cambios precio: "
         f"{STATS.vehicles_price_changed}"
     )
     logger.info(
-        f"   📊 Activos: {active} | "
+        f"  🗃️ Archivados hoy: {STATS.vehicles_archived}"
+    )
+    logger.info(
+        f"  📊 Activos: {active} | "
         f"Marca: {with_marca} | Modelo: {with_modelo}"
     )
-    logger.info(f"   📈 Historial: {history}")
+    logger.info(f"  📈 Historial: {history}")
+    logger.info(
+        f"  📦 Histórico total (sold): {total_sold}"
+    )
     logger.info("=" * 60)
 
 
@@ -1617,10 +1890,10 @@ async def run_worker():
     logger.info("\n" + "=" * 60)
     logger.info(f"✅ WORKER {WORKER_ID} COMPLETADO")
     logger.info(
-        f"   ⏱️ {elapsed:.1f}s | 🚗 {len(results)}"
+        f"  ⏱️ {elapsed:.1f}s | 🚗 {len(results)}"
     )
     logger.info(
-        f"   📊 Marca: {with_marca} | "
+        f"  📊 Marca: {with_marca} | "
         f"Modelo: {with_modelo}"
     )
     logger.info("=" * 60)
@@ -1641,5 +1914,6 @@ def main():
         fatal_error("Error", e)
 
 
+# ── FIX: era 'if name == "main"' sin __ ──
 if __name__ == "__main__":
     main()
