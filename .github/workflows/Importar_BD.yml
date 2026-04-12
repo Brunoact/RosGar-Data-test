@@ -1,0 +1,155 @@
+name: 📥 Importar BD desde Release
+
+# Solo se dispara manualmente.
+# Uso: cuando tenés una BD recuperada que querés
+# establecer como base para los próximos scrapings.
+#
+# PASOS PREVIOS (desde la web de GitHub):
+#   1. Ir a Releases → "Draft a new release"
+#   2. Tag: import-YYYY-MM-DD (ej: import-2026-04-11)
+#   3. Title: "Importación manual YYYY-MM-DD"
+#   4. Subir el archivo rosariogarage.db como asset
+#   5. Publicar el Release
+#   6. Volver a Actions → este workflow → Run workflow
+#   7. Pegar el tag del Release en el input
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag del Release con la BD (ej: import-2026-04-11)'
+        required: true
+        type: string
+      confirmar:
+        description: 'Escribir CONFIRMAR para proceder (evita disparos accidentales)'
+        required: true
+        type: string
+
+jobs:
+  importar:
+    name: 📥 Importar BD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔒 Verificar confirmación
+        run: |
+          if [ "${{ inputs.confirmar }}" != "CONFIRMAR" ]; then
+            echo "❌ Debés escribir CONFIRMAR en el campo de confirmación."
+            echo "   Valor recibido: '${{ inputs.confirmar }}'"
+            exit 1
+          fi
+          echo "✅ Confirmación válida"
+
+      - name: 📥 Descargar BD desde Release
+        run: |
+          echo "📥 Descargando desde Release: ${{ inputs.release_tag }}"
+
+          # Intentar descargar usando la API de GitHub
+          # El asset debe llamarse rosariogarage.db
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "rosariogarage.db" \
+            --output rosariogarage.db \
+            --clobber
+
+          if [ ! -f "rosariogarage.db" ]; then
+            echo "❌ No se pudo descargar rosariogarage.db"
+            echo "   Verificar que el Release '${{ inputs.release_tag }}'"
+            echo "   existe y tiene un asset llamado 'rosariogarage.db'"
+            exit 1
+          fi
+
+          echo "✅ Descargado: $(du -h rosariogarage.db | cut -f1)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 Verificar integridad de la BD
+        run: |
+          echo "📊 Verificando BD descargada..."
+
+          # Verificar que es un SQLite válido
+          sqlite3 rosariogarage.db "PRAGMA integrity_check;" | head -5
+
+          # Estadísticas básicas
+          TOTAL=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM vehicles;" 2>/dev/null || echo "ERROR")
+          ACTIVOS=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM vehicles WHERE activo = 1;" \
+            2>/dev/null || echo "ERROR")
+          HISTORY=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM price_history;" \
+            2>/dev/null || echo "ERROR")
+
+          # sold_vehicles (puede no existir en BDs antiguas)
+          SOLD=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM sold_vehicles;" \
+            2>/dev/null || echo "tabla no existe aún")
+
+          echo ""
+          echo "════════════════════════════════════"
+          echo "📊 BD a importar:"
+          echo "   Total vehículos:    $TOTAL"
+          echo "   Activos:            $ACTIVOS"
+          echo "   Historial precios:  $HISTORY"
+          echo "   Sold vehicles:      $SOLD"
+          echo "   Tamaño:             $(du -h rosariogarage.db | cut -f1)"
+          echo "════════════════════════════════════"
+
+          if [ "$TOTAL" = "ERROR" ]; then
+            echo "❌ La BD no es válida o está corrupta"
+            exit 1
+          fi
+
+          if [ "$ACTIVOS" = "0" ] || [ "$ACTIVOS" = "ERROR" ]; then
+            echo "⚠️  ADVERTENCIA: La BD no tiene vehículos activos"
+            echo "   ¿Es correcta la BD que estás importando?"
+          fi
+
+      - name: 📤 Subir como artifact master-db
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-master-db
+          path: rosariogarage.db
+          # 30 días — consistente con scrape.yml
+          retention-days: 30
+          compression-level: 9
+          if-no-files-found: error
+
+      - name: 📤 Subir también como artifact para dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosariogarage-db
+          path: rosariogarage.db
+          retention-days: 30
+          compression-level: 9
+          if-no-files-found: error
+
+      - name: 🚀 Notificar dashboard
+        if: success()
+        uses: peter-evans/repository-dispatch@v3
+        continue-on-error: true
+        with:
+          token: ${{ secrets.DASHBOARD_REPO_PAT }}
+          repository: Brunoact/Ros-Gar-Dash
+          event-type: db-updated
+          client-payload: >-
+            {
+              "run_id": "${{ github.run_id }}",
+              "source": "manual_import",
+              "release_tag": "${{ inputs.release_tag }}"
+            }
+
+      - name: 📝 Resumen
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # 📥 Importación Manual Completada
+
+          | Campo | Valor |
+          |-------|-------|
+          | Release origen | \`${{ inputs.release_tag }}\` |
+          | Artifact generado | \`rosariogarage-master-db\` |
+          | Retención | 30 días |
+
+          El próximo run del scraping diario usará esta BD como base.
+          EOF
