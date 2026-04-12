@@ -3,6 +3,7 @@ name: 💾 Backup Mensual
 on:
   schedule:
     # Día 1 de cada mes a las 12:00 UTC
+    # (después del scraping de las 6am — ya hay artifact del día)
     - cron: '0 12 1 * *'
   workflow_dispatch:
 
@@ -10,44 +11,110 @@ jobs:
   backup:
     name: 📦 Crear Backup en Release
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: 📥 Descargar última BD consolidada
-        uses: dawidd6/action-download-artifact@v3
+        id: download
+        # FIX: era @v3 — API incompatible, sin soporte activo
+        # @v6 acepta if_no_artifact_found y search_artifacts
+        uses: dawidd6/action-download-artifact@v6
         with:
           name: rosariogarage-master-db
           workflow: scrape.yml
           workflow_conclusion: success
-      
+          if_no_artifact_found: ignore
+          search_artifacts: true
+          allow_forks: false
+
+      - name: 🔍 Verificar que existe la BD
+        run: |
+          if [ ! -f "rosariogarage.db" ]; then
+            echo "❌ ERROR: No se encontró rosariogarage.db"
+            echo "  Verificar que el workflow scrape.yml"
+            echo "  haya corrido exitosamente este mes."
+            exit 1
+          fi
+          echo "✅ BD encontrada: $(du -h rosariogarage.db | cut -f1)"
+
       - name: 📅 Obtener fecha
         id: date
         run: |
           echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
           echo "full=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-      
+
       - name: 📊 Generar info del backup
         id: info
         run: |
           python3 << 'EOF'
           import sqlite3
           import os
-          
+          import json
+
           conn = sqlite3.connect('rosariogarage.db')
-          total = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
-          activos = conn.execute("SELECT COUNT(*) FROM vehicles WHERE activo = 1").fetchone()[0]
-          history = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+
+          total = conn.execute(
+              "SELECT COUNT(*) FROM vehicles"
+          ).fetchone()[0]
+
+          activos = conn.execute(
+              "SELECT COUNT(*) FROM vehicles WHERE activo = 1"
+          ).fetchone()[0]
+
+          history = conn.execute(
+              "SELECT COUNT(*) FROM price_history"
+          ).fetchone()[0]
+
+          # sold_vehicles — con guard por si la tabla no existe
+          # en BDs generadas antes de la v2.8 del scraper
+          try:
+              sold_total = conn.execute(
+                  "SELECT COUNT(*) FROM sold_vehicles"
+              ).fetchone()[0]
+
+              sold_este_mes = conn.execute(
+                  "SELECT COUNT(*) FROM sold_vehicles "
+                  "WHERE strftime('%Y-%m', fecha_archivo) = "
+                  "strftime('%Y-%m', 'now')"
+              ).fetchone()[0]
+
+              sold_fecha_min = conn.execute(
+                  "SELECT MIN(primera_vista) FROM sold_vehicles"
+              ).fetchone()[0] or 'N/A'
+
+              sold_fecha_max = conn.execute(
+                  "SELECT MAX(ultima_vista) FROM sold_vehicles"
+              ).fetchone()[0] or 'N/A'
+
+          except Exception:
+              sold_total = 0
+              sold_este_mes = 0
+              sold_fecha_min = 'N/A'
+              sold_fecha_max = 'N/A'
+
           size_bytes = os.path.getsize('rosariogarage.db')
           size_mb = size_bytes / 1024 / 1024
-          
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+
+          conn.close()
+
+          output_file = os.environ['GITHUB_OUTPUT']
+          with open(output_file, 'a') as f:
               f.write(f"total_vehicles={total}\n")
               f.write(f"active_vehicles={activos}\n")
               f.write(f"history_records={history}\n")
               f.write(f"size_mb={size_mb:.2f}\n")
-          
-          conn.close()
+              f.write(f"sold_total={sold_total}\n")
+              f.write(f"sold_este_mes={sold_este_mes}\n")
+              f.write(f"sold_fecha_min={sold_fecha_min}\n")
+              f.write(f"sold_fecha_max={sold_fecha_max}\n")
+
+          print(f"✅ Vehículos totales:   {total}")
+          print(f"✅ Activos:             {activos}")
+          print(f"✅ Historial precios:   {history}")
+          print(f"✅ Sold total:          {sold_total}")
+          print(f"✅ Sold este mes:       {sold_este_mes}")
+          print(f"✅ Tamaño:              {size_mb:.2f} MB")
           EOF
-      
+
       - name: 🗜️ Comprimir BD si es grande
         id: compress
         run: |
@@ -62,7 +129,7 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
             echo "filename=rosariogarage.db" >> $GITHUB_OUTPUT
           fi
-      
+
       - name: 📦 Crear Release
         uses: softprops/action-gh-release@v1
         with:
@@ -70,20 +137,49 @@ jobs:
           name: "💾 Backup ${{ steps.date.outputs.month }}"
           body: |
             ## 📦 Backup Mensual Automático
-            
+
             **📅 Fecha:** ${{ steps.date.outputs.full }}
-            
-            ### 📊 Estadísticas
-            - 🚗 **Vehículos totales:** ${{ steps.info.outputs.total_vehicles }}
-            - ✅ **Activos:** ${{ steps.info.outputs.active_vehicles }}
-            - 📈 **Registros historial:** ${{ steps.info.outputs.history_records }}
-            - 💾 **Tamaño:** ${{ steps.info.outputs.size_mb }} MB
-            
+
+            ### 📊 Vehículos activos
+            | Métrica | Valor |
+            |---------|-------|
+            | Total en BD | ${{ steps.info.outputs.total_vehicles }} |
+            | Activos | ${{ steps.info.outputs.active_vehicles }} |
+            | Registros historial de precios | ${{ steps.info.outputs.history_records }} |
+            | Tamaño | ${{ steps.info.outputs.size_mb }} MB |
+
+            ### 🗃️ Histórico de vendidos (sold_vehicles)
+            | Métrica | Valor |
+            |---------|-------|
+            | Total archivados (acumulado) | ${{ steps.info.outputs.sold_total }} |
+            | Archivados este mes | ${{ steps.info.outputs.sold_este_mes }} |
+            | Publicaciones desde | ${{ steps.info.outputs.sold_fecha_min }} |
+            | Última baja registrada | ${{ steps.info.outputs.sold_fecha_max }} |
+
+            > La tabla `sold_vehicles` contiene el histórico permanente de todos los
+            > vehículos que dejaron de aparecer en el sitio, con su historial de
+            > precios completo en JSON. Esta tabla **nunca se borra**.
+
             ### 📥 Uso
             ```bash
-            gh release download backup-${{ steps.date.outputs.month }} -p "rosariogarage.db*"
-            gunzip rosariogarage.db.gz  # Si está comprimido
-            sqlite3 rosariogarage.db "SELECT COUNT(*) FROM vehicles WHERE activo = 1;"
+            # Descargar este backup
+            gh release download backup-${{ steps.date.outputs.month }} \
+              -p "rosariogarage.db*"
+
+            # Descomprimir si está comprimido
+            gunzip rosariogarage.db.gz
+
+            # Consultar activos
+            sqlite3 rosariogarage.db \
+              "SELECT COUNT(*) FROM vehicles WHERE activo = 1;"
+
+            # Consultar vendidos históricos
+            sqlite3 rosariogarage.db \
+              "SELECT marca, modelo, año, precio_inicial_usd,
+                      precio_final_usd, dias_en_mercado
+               FROM sold_vehicles
+               ORDER BY ultima_vista DESC
+               LIMIT 20;"
             ```
           files: ${{ steps.compress.outputs.filename }}
           draft: false
