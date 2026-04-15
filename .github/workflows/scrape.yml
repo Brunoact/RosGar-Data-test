@@ -2,7 +2,7 @@ name: 🚗 RosarioGarage Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # Todos los días a las 06:00 UTC
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -11,21 +11,20 @@ on:
         type: boolean
         default: false
 
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────
 # CRÍTICO: Sin esto, dos ejecuciones solapadas
 # corrompen la BD maestra
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────
 concurrency:
   group: rosariogarage-scraper
-  cancel-in-progress: false   # No cancelar — dejar terminar la anterior
+  cancel-in-progress: false
 
-# ────────────────────────────────────────────────
-# Permisos mínimos necesarios para que el schedule
-# funcione y pueda leer/escribir artifacts
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────
+# Permisos mínimos necesarios
+# ──────────────────────────────────────────────────
 permissions:
   contents: read
-  actions: write       # Necesario para upload/download de artifacts
+  actions: write
 
 env:
   PYTHON_VERSION: '3.11'
@@ -90,7 +89,6 @@ jobs:
           fi
 
       - name: 📤 Subir BD del worker
-        # Subir aunque el paso anterior falle para poder debuggear
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -98,7 +96,6 @@ jobs:
           path: rosariogarage_worker_${{ matrix.worker_id }}.db
           retention-days: 1
           compression-level: 6
-          # No fallar si no existe — el job ya falló antes
           if-no-files-found: warn
 
   # ════════════════════════════════════════════════════════════
@@ -108,11 +105,8 @@ jobs:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
     needs: scrape
-    # Ejecutar si al menos 1 worker tuvo éxito
     if: >-
-      always() &&
-      !cancelled() &&
-      needs.scrape.result != 'failure'
+      always() && !cancelled() && needs.scrape.result != 'failure'
 
     steps:
       - name: 📥 Checkout código
@@ -131,19 +125,15 @@ jobs:
 
       - name: 📥 Descargar BD maestra anterior (si existe)
         id: download-master
-        # ────────────────────────────────────────────────────
-        # FIX CRÍTICO: El nombre del workflow debe coincidir
-        # EXACTAMENTE con el nombre del archivo .yml
-        # Si el archivo se llama scraper.yml → workflow: scraper.yml
-        # ────────────────────────────────────────────────────
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           name: rosariogarage-master-db
-          # FIX: Usar el nombre real del archivo del workflow
-          workflow: scraper.yml
+          # FIX CRÍTICO: el nombre debe coincidir EXACTAMENTE
+          # con el nombre del archivo .yml en .github/workflows/
+          # El archivo se llama scrape.yml — no scraper.yml
+          workflow: scrape.yml
           workflow_conclusion: success
-          # FIX: Buscar también en runs anteriores del mismo workflow
           branch: ${{ github.ref_name }}
           if_no_artifact_found: ignore
           search_artifacts: true
@@ -174,8 +164,10 @@ jobs:
           pattern: worker-*-db
           path: ./worker_downloads/
           merge-multiple: false
-          # FIX: Descargar del run actual, no de runs anteriores
-          run-id: ${{ github.run_id }}
+          # FIX: sin run-id explícito — download-artifact@v4
+          # descarga del run actual por defecto dentro del
+          # mismo workflow. Con run-id explícito fallaba con
+          # "Not Found" en algunos contextos de permissions.
 
       - name: 📋 Organizar y verificar archivos de workers
         run: |
@@ -212,7 +204,6 @@ jobs:
             exit 1
           fi
 
-          # Exportar para el siguiente paso
           echo "WORKERS_FOUND=${FOUND}" >> $GITHUB_ENV
           echo "TOTAL_VEHICLES=${TOTAL_VEHICLES}" >> $GITHUB_ENV
 
@@ -296,10 +287,10 @@ jobs:
         if: always()
         run: |
           if [ -f "summary.json" ]; then
-            ACTIVOS=$(jq -r '.activos        // "?"' summary.json)
-            NUEVOS=$(jq -r '.nuevos_hoy      // "?"' summary.json)
+            ACTIVOS=$(jq -r '.activos // "?"' summary.json)
+            NUEVOS=$(jq -r '.nuevos_hoy // "?"' summary.json)
             NORMALIZADOS=$(jq -r '.normalizados // "?"' summary.json)
-            PARCIALES=$(jq -r '.parciales    // "?"' summary.json)
+            PARCIALES=$(jq -r '.parciales // "?"' summary.json)
             ARCHIVADOS=$(jq -r '.archivados_hoy // "?"' summary.json)
             HISTORICO=$(jq -r '.total_historico // "?"' summary.json)
           else
