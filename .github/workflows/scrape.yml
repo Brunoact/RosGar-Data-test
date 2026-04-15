@@ -2,7 +2,7 @@ name: 🚗 RosarioGarage Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # Todos los días a las 06:00 UTC
   workflow_dispatch:
     inputs:
       debug:
@@ -10,6 +10,22 @@ on:
         required: false
         type: boolean
         default: false
+
+# ────────────────────────────────────────────────
+# CRÍTICO: Sin esto, dos ejecuciones solapadas
+# corrompen la BD maestra
+# ────────────────────────────────────────────────
+concurrency:
+  group: rosariogarage-scraper
+  cancel-in-progress: false   # No cancelar — dejar terminar la anterior
+
+# ────────────────────────────────────────────────
+# Permisos mínimos necesarios para que el schedule
+# funcione y pueda leer/escribir artifacts
+# ────────────────────────────────────────────────
+permissions:
+  contents: read
+  actions: write       # Necesario para upload/download de artifacts
 
 env:
   PYTHON_VERSION: '3.11'
@@ -47,7 +63,6 @@ jobs:
         env:
           WORKER_ID: ${{ matrix.worker_id }}
           TOTAL_WORKERS: ${{ env.TOTAL_WORKERS }}
-          # FIX: era '{{ inputs.debug }}' sin el signo $
           DEBUG_MODE: ${{ inputs.debug || 'false' }}
         run: python scraper_rosariogarage.py
         timeout-minutes: 30
@@ -55,7 +70,6 @@ jobs:
       - name: 📊 Info de la BD del worker
         if: always()
         run: |
-          # FIX: interpolación correcta con ${{ }} en bash
           DB_FILE="rosariogarage_worker_${{ matrix.worker_id }}.db"
           if [ -f "$DB_FILE" ]; then
             echo "✅ Archivo encontrado: $DB_FILE"
@@ -76,15 +90,16 @@ jobs:
           fi
 
       - name: 📤 Subir BD del worker
-        if: success()
+        # Subir aunque el paso anterior falle para poder debuggear
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: worker-${{ matrix.worker_id }}-db
           path: rosariogarage_worker_${{ matrix.worker_id }}.db
-          # Workers solo necesitan vivir hasta que consolida
           retention-days: 1
           compression-level: 6
-          if-no-files-found: error
+          # No fallar si no existe — el job ya falló antes
+          if-no-files-found: warn
 
   # ════════════════════════════════════════════════════════════
   # JOB 2: Consolidar resultados de todos los workers
@@ -93,7 +108,11 @@ jobs:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
     needs: scrape
-    if: always() && !cancelled() && needs.scrape.result != 'failure'
+    # Ejecutar si al menos 1 worker tuvo éxito
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.scrape.result != 'failure'
 
     steps:
       - name: 📥 Checkout código
@@ -103,6 +122,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
       - name: 📦 Instalar dependencias
         run: |
@@ -111,12 +131,20 @@ jobs:
 
       - name: 📥 Descargar BD maestra anterior (si existe)
         id: download-master
+        # ────────────────────────────────────────────────────
+        # FIX CRÍTICO: El nombre del workflow debe coincidir
+        # EXACTAMENTE con el nombre del archivo .yml
+        # Si el archivo se llama scraper.yml → workflow: scraper.yml
+        # ────────────────────────────────────────────────────
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           name: rosariogarage-master-db
-          workflow: scrape.yml
+          # FIX: Usar el nombre real del archivo del workflow
+          workflow: scraper.yml
           workflow_conclusion: success
+          # FIX: Buscar también en runs anteriores del mismo workflow
+          branch: ${{ github.ref_name }}
           if_no_artifact_found: ignore
           search_artifacts: true
           allow_forks: false
@@ -129,7 +157,6 @@ jobs:
             sqlite3 rosariogarage.db \
               "SELECT COUNT(*) || ' vehículos existentes' FROM vehicles;" \
               2>/dev/null || true
-            # Verificar si ya tiene sold_vehicles
             sqlite3 rosariogarage.db \
               "SELECT COUNT(*) || ' registros en sold_vehicles' FROM sold_vehicles;" \
               2>/dev/null || echo "ℹ️ Tabla sold_vehicles aún no existe (se creará)"
@@ -147,12 +174,14 @@ jobs:
           pattern: worker-*-db
           path: ./worker_downloads/
           merge-multiple: false
+          # FIX: Descargar del run actual, no de runs anteriores
+          run-id: ${{ github.run_id }}
 
-      - name: 📋 Organizar archivos de workers
+      - name: 📋 Organizar y verificar archivos de workers
         run: |
           echo "=== Moviendo archivos al directorio raíz ==="
           find ./worker_downloads -type f -name "*.db" | while read f; do
-            echo "  Moviendo: $f"
+            echo "  Moviendo: $f → $(basename $f)"
             mv "$f" .
           done
 
@@ -183,11 +212,14 @@ jobs:
             exit 1
           fi
 
+          # Exportar para el siguiente paso
+          echo "WORKERS_FOUND=${FOUND}" >> $GITHUB_ENV
+          echo "TOTAL_VEHICLES=${TOTAL_VEHICLES}" >> $GITHUB_ENV
+
       - name: 🔄 Ejecutar consolidación
         env:
           CONSOLIDATE_MODE: 'true'
           TOTAL_WORKERS: ${{ env.TOTAL_WORKERS }}
-          # FIX: era '{{ inputs.debug }}' sin el signo $
           DEBUG_MODE: ${{ inputs.debug || 'false' }}
         run: python scraper_rosariogarage.py
 
@@ -205,7 +237,10 @@ jobs:
               "SELECT COUNT(*) || ' registros en sold_vehicles' FROM sold_vehicles;" \
               2>/dev/null || true
             sqlite3 rosariogarage.db \
-              "SELECT norm_status || ': ' || COUNT(*) FROM vehicles WHERE activo=1 GROUP BY norm_status ORDER BY COUNT(*) DESC;" \
+              "SELECT norm_status || ': ' || COUNT(*) \
+               FROM vehicles WHERE activo=1 \
+               GROUP BY norm_status \
+               ORDER BY COUNT(*) DESC;" \
               2>/dev/null || true
           else
             echo "❌ ERROR: No se generó rosariogarage.db"
@@ -215,10 +250,13 @@ jobs:
       - name: 🗜️ Optimizar BD si es grande
         run: |
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
-          echo "💾 Tamaño: $(du -h rosariogarage.db | cut -f1)"
-          if [ $SIZE_MB -gt 50 ]; then
+          echo "💾 Tamaño actual: $(du -h rosariogarage.db | cut -f1)"
+          if [ "$SIZE_MB" -gt 50 ]; then
+            echo "🗜️ Ejecutando VACUUM..."
             sqlite3 rosariogarage.db "VACUUM;"
-            echo "✅ Optimizada: $(du -h rosariogarage.db | cut -f1)"
+            echo "✅ Post-VACUUM: $(du -h rosariogarage.db | cut -f1)"
+          else
+            echo "ℹ️ No requiere optimización (<50 MB)"
           fi
 
       - name: 📤 Subir BD consolidada (master)
@@ -226,8 +264,6 @@ jobs:
         with:
           name: rosariogarage-master-db
           path: rosariogarage.db
-          # FIX: era 90 días — excedía el límite de 500 MB
-          # Con sold_vehicles el histórico no depende de esto
           retention-days: 30
           compression-level: 9
           if-no-files-found: error
@@ -237,7 +273,6 @@ jobs:
         with:
           name: rosariogarage-db
           path: rosariogarage.db
-          # FIX: era 90 días — mismo problema de cuota
           retention-days: 30
           compression-level: 9
           if-no-files-found: error
@@ -253,18 +288,18 @@ jobs:
           client-payload: >-
             {
               "run_id": "${{ github.run_id }}",
-              "scrape_date": "${{ github.event.repository.updated_at }}"
+              "workers_ok": "${{ env.WORKERS_FOUND }}",
+              "scrape_date": "${{ github.run_started_at }}"
             }
 
-      - name: 📝 Resumen
+      - name: 📝 Resumen final
         if: always()
         run: |
-          # summary.json lo genera el scraper al final de consolidate()
           if [ -f "summary.json" ]; then
-            ACTIVOS=$(jq -r '.activos // "?"' summary.json)
-            NUEVOS=$(jq -r '.nuevos_hoy // "?"' summary.json)
+            ACTIVOS=$(jq -r '.activos        // "?"' summary.json)
+            NUEVOS=$(jq -r '.nuevos_hoy      // "?"' summary.json)
             NORMALIZADOS=$(jq -r '.normalizados // "?"' summary.json)
-            PARCIALES=$(jq -r '.parciales // "?"' summary.json)
+            PARCIALES=$(jq -r '.parciales    // "?"' summary.json)
             ARCHIVADOS=$(jq -r '.archivados_hoy // "?"' summary.json)
             HISTORICO=$(jq -r '.total_historico // "?"' summary.json)
           else
@@ -273,14 +308,15 @@ jobs:
           fi
 
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          # ✅ Scraping Completado
+          # ✅ Scraping Completado — $(date -u '+%Y-%m-%d %H:%M UTC')
 
-          | Métrica | Valor |
-          |---------|-------|
-          | Activos | **${ACTIVOS}** |
-          | Nuevos hoy | **${NUEVOS}** |
-          | Full match | **${NORMALIZADOS}** |
-          | Partial match | **${PARCIALES}** |
-          | Archivados hoy | **${ARCHIVADOS}** |
-          | Histórico total | **${HISTORICO}** |
+          | Métrica          | Valor               |
+          |------------------|---------------------|
+          | Activos          | **${ACTIVOS}**      |
+          | Nuevos hoy       | **${NUEVOS}**       |
+          | Full match       | **${NORMALIZADOS}** |
+          | Partial match    | **${PARCIALES}**    |
+          | Archivados hoy   | **${ARCHIVADOS}**   |
+          | Histórico total  | **${HISTORICO}**    |
+          | Workers OK       | **${WORKERS_FOUND:-?}/8** |
           EOF
