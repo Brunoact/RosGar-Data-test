@@ -66,17 +66,11 @@ jobs:
           if [ -f "$DB_FILE" ]; then
             echo "✅ Archivo encontrado: $DB_FILE"
             ls -lh "$DB_FILE"
-            echo ""
-            echo "📊 Estadísticas:"
             sqlite3 "$DB_FILE" \
               "SELECT COUNT(*) as 'Vehículos:' FROM vehicles;" \
               2>/dev/null || echo "⚠️ Sin datos"
-            sqlite3 "$DB_FILE" \
-              "SELECT key, value FROM scrape_metadata;" \
-              2>/dev/null || true
           else
             echo "❌ ERROR: No se generó $DB_FILE"
-            echo "Archivos en directorio:"
             ls -la
             exit 1
           fi
@@ -115,18 +109,83 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 📥 Descargar BD maestra anterior
-        id: download-master
+      - name: 📥 Descargar BD maestra (cualquier workflow)
+        # ──────────────────────────────────────────────────────
+        # Usa gh api para buscar el artifact más reciente con
+        # el nombre "rosariogarage-master-db" en CUALQUIER
+        # workflow del repo, ordenado por fecha de creación
+        # descendente. Descarga el primero no expirado.
+        # Esto resuelve el problema de dawidd6 que filtra
+        # por workflow ID aunque no se especifique workflow:.
+        # ──────────────────────────────────────────────────────
+        run: |
+          echo "🔍 Buscando artifact rosariogarage-master-db..."
+
+          # Obtener el artifact más reciente no expirado
+          ARTIFACT_INFO=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=rosariogarage-master-db&per_page=10" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0]' \
+            2>/dev/null || echo "null")
+
+          if [ "$ARTIFACT_INFO" = "null" ] || [ -z "$ARTIFACT_INFO" ]; then
+            echo "⚠️ No se encontró artifact rosariogarage-master-db"
+            echo "MASTER_DB_MISSING=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ARTIFACT_ID=$(echo "$ARTIFACT_INFO" | jq -r '.id')
+          ARTIFACT_SIZE=$(echo "$ARTIFACT_INFO" | jq -r '.size_in_bytes')
+          ARTIFACT_DATE=$(echo "$ARTIFACT_INFO" | jq -r '.created_at')
+          WORKFLOW_ID=$(echo "$ARTIFACT_INFO" | jq -r '.workflow_run.id')
+
+          echo "✅ Artifact encontrado:"
+          echo "   ID:       $ARTIFACT_ID"
+          echo "   Tamaño:   $(echo "scale=2; $ARTIFACT_SIZE/1048576" | bc) MB"
+          echo "   Creado:   $ARTIFACT_DATE"
+          echo "   Run ID:   $WORKFLOW_ID"
+
+          # Descargar usando la URL de descarga de la API
+          DOWNLOAD_URL=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" \
+            --include 2>/dev/null | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
+
+          if [ -z "$DOWNLOAD_URL" ]; then
+            # Alternativa: usar gh run download
+            echo "  Intentando descarga alternativa..."
+            gh api \
+              "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" \
+              > rosariogarage-master-db.zip 2>/dev/null || true
+          else
+            curl -sL "$DOWNLOAD_URL" -o rosariogarage-master-db.zip
+          fi
+
+          # Si ninguno funcionó, usar dawidd6 como fallback
+          if [ ! -f "rosariogarage-master-db.zip" ] || [ ! -s "rosariogarage-master-db.zip" ]; then
+            echo "⚠️ Descarga directa falló — usando fallback"
+            echo "USAR_DAWIDD6=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          unzip -q rosariogarage-master-db.zip -d . 2>/dev/null || true
+          rm -f rosariogarage-master-db.zip
+
+          if [ -f "rosariogarage.db" ]; then
+            echo "✅ BD extraída: $(du -h rosariogarage.db | cut -f1)"
+          else
+            echo "⚠️ No se encontró rosariogarage.db en el zip"
+            echo "MASTER_DB_MISSING=true" >> $GITHUB_ENV
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📥 Fallback — dawidd6 si la API falló
+        if: env.USAR_DAWIDD6 == 'true'
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           name: rosariogarage-master-db
-          # ──────────────────────────────────────────────────
-          # SIN workflow: — busca el artifact más reciente
-          # con ese nombre en CUALQUIER workflow del repo.
-          # Esto permite que import-db.yml y scrape.yml
-          # compartan el mismo artifact sin conflicto.
-          # ──────────────────────────────────────────────────
+          workflow: scrape.yml
+          workflow_conclusion: success
           if_no_artifact_found: ignore
           search_artifacts: true
           allow_forks: false
@@ -134,14 +193,7 @@ jobs:
       - name: 📋 Verificar BD maestra anterior
         run: |
           if [ ! -f "rosariogarage.db" ]; then
-            echo "⚠️  ════════════════════════════════════════════"
             echo "⚠️  NO SE ENCONTRÓ BD MAESTRA ANTERIOR"
-            echo "⚠️  Si es la primera ejecución → normal"
-            echo "⚠️  Si NO es la primera vez:"
-            echo "⚠️    1. Verificar artifacts en runs anteriores"
-            echo "⚠️    2. Usar Importar_BD.yml para restaurar"
-            echo "⚠️    3. Luego disparar scrape.yml manualmente"
-            echo "⚠️  ════════════════════════════════════════════"
             echo "MASTER_DB_MISSING=true" >> $GITHUB_ENV
             exit 0
           fi
@@ -161,6 +213,10 @@ jobs:
           echo "   Sold vehicles: $SOLD"
           echo "   Tamaño:        ${SIZE_MB}M"
 
+          # Guardar métricas para el resumen
+          echo "BD_TOTAL=$TOTAL" >> $GITHUB_ENV
+          echo "BD_SOLD=$SOLD" >> $GITHUB_ENV
+
       - name: 📁 Crear directorio para workers
         run: mkdir -p ./worker_downloads
 
@@ -179,8 +235,6 @@ jobs:
             mv "$f" .
           done
 
-          echo ""
-          echo "=== Verificación detallada ==="
           FOUND=0
           TOTAL_VEHICLES=0
           for i in {0..7}; do
@@ -196,7 +250,6 @@ jobs:
             fi
           done
 
-          echo ""
           echo "════════════════════════════════════════"
           echo "📊 Workers: ${FOUND}/8 | Vehículos: ${TOTAL_VEHICLES}"
           echo "════════════════════════════════════════"
@@ -207,7 +260,6 @@ jobs:
           fi
 
           echo "WORKERS_FOUND=${FOUND}" >> $GITHUB_ENV
-          echo "TOTAL_VEHICLES=${TOTAL_VEHICLES}" >> $GITHUB_ENV
 
       - name: 🔄 Ejecutar consolidación
         env:
