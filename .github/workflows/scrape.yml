@@ -11,17 +11,10 @@ on:
         type: boolean
         default: false
 
-# ──────────────────────────────────────────────────
-# CRÍTICO: Sin esto, dos ejecuciones solapadas
-# corrompen la BD maestra
-# ──────────────────────────────────────────────────
 concurrency:
   group: rosariogarage-scraper
   cancel-in-progress: false
 
-# ──────────────────────────────────────────────────
-# Permisos mínimos necesarios
-# ──────────────────────────────────────────────────
 permissions:
   contents: read
   actions: write
@@ -76,10 +69,10 @@ jobs:
             echo ""
             echo "📊 Estadísticas:"
             sqlite3 "$DB_FILE" \
-              "SELECT COUNT(*) || ' vehículos en worker ${{ matrix.worker_id }}' FROM vehicles;" \
+              "SELECT COUNT(*) as 'Vehículos en worker ${{ matrix.worker_id }}:' FROM vehicles;" \
               2>/dev/null || echo "⚠️ Sin datos"
             sqlite3 "$DB_FILE" \
-              "SELECT key || ': ' || value FROM scrape_metadata;" \
+              "SELECT key, value FROM scrape_metadata;" \
               2>/dev/null || true
           else
             echo "❌ ERROR: No se generó $DB_FILE"
@@ -89,14 +82,14 @@ jobs:
           fi
 
       - name: 📤 Subir BD del worker
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: worker-${{ matrix.worker_id }}-db
           path: rosariogarage_worker_${{ matrix.worker_id }}.db
           retention-days: 1
           compression-level: 6
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # ════════════════════════════════════════════════════════════
   # JOB 2: Consolidar resultados de todos los workers
@@ -105,8 +98,7 @@ jobs:
     name: 📊 Consolidar Resultados
     runs-on: ubuntu-latest
     needs: scrape
-    if: >-
-      always() && !cancelled() && needs.scrape.result != 'failure'
+    if: always() && !cancelled() && needs.scrape.result != 'failure'
 
     steps:
       - name: 📥 Checkout código
@@ -123,18 +115,34 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 📥 Descargar BD maestra anterior (si existe)
-        id: download-master
+      - name: 📥 Buscar BD maestra en scrape.yml
+        id: download-from-scrape
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           name: rosariogarage-master-db
-          # FIX CRÍTICO: el nombre debe coincidir EXACTAMENTE
-          # con el nombre del archivo .yml en .github/workflows/
-          # El archivo se llama scrape.yml — no scraper.yml
           workflow: scrape.yml
           workflow_conclusion: success
-          branch: ${{ github.ref_name }}
+          if_no_artifact_found: ignore
+          search_artifacts: true
+          allow_forks: false
+
+      - name: 📥 Buscar BD maestra en Importar_BD.yml (fallback)
+        # ──────────────────────────────────────────────────────
+        # SOLUCIÓN AL BUG: dawidd6 filtra por workflow.
+        # Si import-db.yml fue el último en subir el artifact,
+        # el paso anterior no lo encuentra. Este paso lo busca
+        # en el workflow de importación como fallback.
+        # Solo se ejecuta si el paso anterior no encontró nada.
+        # ──────────────────────────────────────────────────────
+        id: download-from-import
+        if: steps.download-from-scrape.outcome == 'failure' || steps.download-from-scrape.outcome == 'skipped'
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: rosariogarage-master-db
+          workflow: Importar_BD.yml
+          workflow_conclusion: success
           if_no_artifact_found: ignore
           search_artifacts: true
           allow_forks: false
@@ -144,15 +152,27 @@ jobs:
           if [ -f "rosariogarage.db" ]; then
             echo "✅ BD maestra anterior encontrada"
             ls -lh rosariogarage.db
-            sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) || ' vehículos existentes' FROM vehicles;" \
-              2>/dev/null || true
-            sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) || ' registros en sold_vehicles' FROM sold_vehicles;" \
-              2>/dev/null || echo "ℹ️ Tabla sold_vehicles aún no existe (se creará)"
+
+            TOTAL=$(sqlite3 rosariogarage.db \
+              "SELECT COUNT(*) FROM vehicles;" 2>/dev/null || echo "?")
+            ACTIVOS=$(sqlite3 rosariogarage.db \
+              "SELECT COUNT(*) FROM vehicles WHERE activo=1;" 2>/dev/null || echo "?")
+            SOLD=$(sqlite3 rosariogarage.db \
+              "SELECT COUNT(*) FROM sold_vehicles;" 2>/dev/null || echo "tabla no existe aún")
+
+            echo "   Total:         $TOTAL vehículos"
+            echo "   Activos:       $ACTIVOS"
+            echo "   Sold vehicles: $SOLD"
           else
-            echo "ℹ️ No existe BD maestra anterior (primera ejecución)"
-            echo "  Se creará una nueva BD desde cero"
+            echo "⚠️  ════════════════════════════════════════════"
+            echo "⚠️  NO SE ENCONTRÓ BD MAESTRA ANTERIOR"
+            echo "⚠️  Si es la primera ejecución → normal"
+            echo "⚠️  Si NO es la primera vez:"
+            echo "⚠️    1. Verificar artifacts en runs anteriores"
+            echo "⚠️    2. Usar Importar_BD.yml para restaurar"
+            echo "⚠️    3. Luego disparar scrape.yml manualmente"
+            echo "⚠️  ════════════════════════════════════════════"
+            echo "MASTER_DB_MISSING=true" >> $GITHUB_ENV
           fi
 
       - name: 📁 Crear directorio para workers
@@ -164,16 +184,12 @@ jobs:
           pattern: worker-*-db
           path: ./worker_downloads/
           merge-multiple: false
-          # FIX: sin run-id explícito — download-artifact@v4
-          # descarga del run actual por defecto dentro del
-          # mismo workflow. Con run-id explícito fallaba con
-          # "Not Found" en algunos contextos de permissions.
 
       - name: 📋 Organizar y verificar archivos de workers
         run: |
           echo "=== Moviendo archivos al directorio raíz ==="
           find ./worker_downloads -type f -name "*.db" | while read f; do
-            echo "  Moviendo: $f → $(basename $f)"
+            echo "  Moviendo: $f"
             mv "$f" .
           done
 
@@ -213,41 +229,104 @@ jobs:
           TOTAL_WORKERS: ${{ env.TOTAL_WORKERS }}
           DEBUG_MODE: ${{ inputs.debug || 'false' }}
         run: python scraper_rosariogarage.py
+        timeout-minutes: 15
 
-      - name: 📋 Verificar BD consolidada
+      - name: 📊 Generar estadísticas
+        if: success()
         run: |
-          if [ -f "rosariogarage.db" ]; then
-            echo "✅ BD consolidada generada"
-            ls -lh rosariogarage.db
-            echo ""
-            echo "📊 Estado final:"
-            sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) || ' vehículos activos' FROM vehicles WHERE activo = 1;" \
-              2>/dev/null || true
-            sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) || ' registros en sold_vehicles' FROM sold_vehicles;" \
-              2>/dev/null || true
-            sqlite3 rosariogarage.db \
-              "SELECT norm_status || ': ' || COUNT(*) \
-               FROM vehicles WHERE activo=1 \
-               GROUP BY norm_status \
-               ORDER BY COUNT(*) DESC;" \
-              2>/dev/null || true
-          else
-            echo "❌ ERROR: No se generó rosariogarage.db"
-            exit 1
-          fi
+          python3 << 'PYTHON_SCRIPT'
+          import sqlite3
+          from datetime import date
+          import json
+
+          def fmt(n):
+              return f"{n:,}".replace(",", ".")
+
+          try:
+              conn = sqlite3.connect('rosariogarage.db')
+              print("=" * 60)
+              print("📊 RESUMEN DEL SCRAPING")
+              print("=" * 60)
+
+              total   = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+              activos = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE activo = 1"
+              ).fetchone()[0]
+              print(f"🚗 Total: {fmt(total)} | Activos: {fmt(activos)}")
+
+              normalizados = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles "
+                  "WHERE norm_status = 'full_match' AND activo = 1"
+              ).fetchone()[0]
+              parciales = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles "
+                  "WHERE norm_status = 'partial_match' AND activo = 1"
+              ).fetchone()[0]
+              print(f"🔧 Full: {fmt(normalizados)} | Parcial: {fmt(parciales)}")
+
+              today  = date.today().isoformat()
+              nuevos = conn.execute(
+                  "SELECT COUNT(*) FROM vehicles WHERE primera_vista = ?",
+                  (today,)
+              ).fetchone()[0]
+              cambios = conn.execute(
+                  "SELECT COUNT(*) FROM price_history WHERE fecha = ?",
+                  (today,)
+              ).fetchone()[0]
+              print(f"📈 Nuevos hoy: {fmt(nuevos)} | Cambios precio: {fmt(cambios)}")
+
+              archivados_hoy  = 0
+              total_historico = 0
+              try:
+                  archivados_hoy = conn.execute(
+                      "SELECT COUNT(*) FROM sold_vehicles WHERE ultima_vista = ?",
+                      (today,)
+                  ).fetchone()[0]
+                  total_historico = conn.execute(
+                      "SELECT COUNT(*) FROM sold_vehicles"
+                  ).fetchone()[0]
+                  print(f"📦 Archivados hoy: {fmt(archivados_hoy)} "
+                        f"| Histórico total: {fmt(total_historico)}")
+              except Exception:
+                  print("ℹ️ Tabla sold_vehicles no existe aún")
+
+              metadata = {}
+              for key, value in conn.execute(
+                  "SELECT key, value FROM scrape_metadata"
+              ):
+                  metadata[key] = value
+
+              summary = {
+                  "total":           total,
+                  "activos":         activos,
+                  "nuevos_hoy":      nuevos,
+                  "cambios_precio":  cambios,
+                  "normalizados":    normalizados,
+                  "parciales":       parciales,
+                  "archivados_hoy":  archivados_hoy,
+                  "total_historico": total_historico,
+                  "dolar_mep":       float(metadata.get('last_dolar_mep', 0)),
+                  "workers":         int(metadata.get('workers_consolidated', 0)),
+              }
+              with open("summary.json", "w") as f:
+                  json.dump(summary, f)
+
+              conn.close()
+              print("=" * 60)
+
+          except Exception as e:
+              print(f"❌ Error: {e}")
+              import traceback; traceback.print_exc()
+              exit(1)
+          PYTHON_SCRIPT
 
       - name: 🗜️ Optimizar BD si es grande
         run: |
           SIZE_MB=$(du -m rosariogarage.db | cut -f1)
-          echo "💾 Tamaño actual: $(du -h rosariogarage.db | cut -f1)"
+          echo "💾 Tamaño: $(du -h rosariogarage.db | cut -f1)"
           if [ "$SIZE_MB" -gt 50 ]; then
-            echo "🗜️ Ejecutando VACUUM..."
             sqlite3 rosariogarage.db "VACUUM;"
-            echo "✅ Post-VACUUM: $(du -h rosariogarage.db | cut -f1)"
-          else
-            echo "ℹ️ No requiere optimización (<50 MB)"
+            echo "✅ Optimizada: $(du -h rosariogarage.db | cut -f1)"
           fi
 
       - name: 📤 Subir BD consolidada (master)
@@ -255,7 +334,7 @@ jobs:
         with:
           name: rosariogarage-master-db
           path: rosariogarage.db
-          retention-days: 30
+          retention-days: 90
           compression-level: 9
           if-no-files-found: error
 
@@ -264,7 +343,7 @@ jobs:
         with:
           name: rosariogarage-db
           path: rosariogarage.db
-          retention-days: 30
+          retention-days: 90
           compression-level: 9
           if-no-files-found: error
 
@@ -287,10 +366,10 @@ jobs:
         if: always()
         run: |
           if [ -f "summary.json" ]; then
-            ACTIVOS=$(jq -r '.activos // "?"' summary.json)
-            NUEVOS=$(jq -r '.nuevos_hoy // "?"' summary.json)
+            ACTIVOS=$(jq -r '.activos         // "?"' summary.json)
+            NUEVOS=$(jq -r '.nuevos_hoy       // "?"' summary.json)
             NORMALIZADOS=$(jq -r '.normalizados // "?"' summary.json)
-            PARCIALES=$(jq -r '.parciales // "?"' summary.json)
+            PARCIALES=$(jq -r '.parciales     // "?"' summary.json)
             ARCHIVADOS=$(jq -r '.archivados_hoy // "?"' summary.json)
             HISTORICO=$(jq -r '.total_historico // "?"' summary.json)
           else
@@ -298,16 +377,39 @@ jobs:
             PARCIALES="?"; ARCHIVADOS="?"; HISTORICO="?"
           fi
 
+          ALERTA=""
+          if [ "${MASTER_DB_MISSING:-false}" = "true" ]; then
+            ALERTA="> ⚠️ **BD maestra no encontrada — se creó desde cero**"
+          fi
+
           cat >> $GITHUB_STEP_SUMMARY << EOF
           # ✅ Scraping Completado — $(date -u '+%Y-%m-%d %H:%M UTC')
 
-          | Métrica          | Valor               |
-          |------------------|---------------------|
-          | Activos          | **${ACTIVOS}**      |
-          | Nuevos hoy       | **${NUEVOS}**       |
-          | Full match       | **${NORMALIZADOS}** |
-          | Partial match    | **${PARCIALES}**    |
-          | Archivados hoy   | **${ARCHIVADOS}**   |
-          | Histórico total  | **${HISTORICO}**    |
+          ${ALERTA}
+
+          | Métrica          | Valor                     |
+          |------------------|---------------------------|
+          | Activos          | **${ACTIVOS}**            |
+          | Nuevos hoy       | **${NUEVOS}**             |
+          | Full match       | **${NORMALIZADOS}**       |
+          | Partial match    | **${PARCIALES}**          |
+          | Archivados hoy   | **${ARCHIVADOS}**         |
+          | Histórico total  | **${HISTORICO}**          |
           | Workers OK       | **${WORKERS_FOUND:-?}/8** |
           EOF
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 3: Limpieza de artifacts de workers
+  # ════════════════════════════════════════════════════════════
+  cleanup:
+    name: 🧹 Limpieza
+    runs-on: ubuntu-latest
+    needs: consolidate
+    if: always()
+
+    steps:
+      - name: 🗑️ Eliminar artifacts de workers
+        uses: geekyeggo/delete-artifact@v4
+        with:
+          name: worker-*-db
+          failOnError: false
