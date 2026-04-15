@@ -1,18 +1,5 @@
 name: 📥 Importar BD desde Release
 
-# Solo se dispara manualmente.
-# Uso: cuando tenés una BD recuperada que querés
-# establecer como base para los próximos scrapings.
-#
-# PASOS PREVIOS (desde la web de GitHub):
-#   1. Ir a Releases → "Draft a new release"
-#   2. Tag: import-YYYY-MM-DD (ej: import-2026-04-11)
-#   3. Title: "Importación manual YYYY-MM-DD"
-#   4. Subir el archivo rosariogarage.db como asset
-#   5. Publicar el Release
-#   6. Volver a Actions → este workflow → Run workflow
-#   7. Pegar el tag del Release en el input
-
 on:
   workflow_dispatch:
     inputs:
@@ -21,9 +8,13 @@ on:
         required: true
         type: string
       confirmar:
-        description: 'Escribir CONFIRMAR para proceder (evita disparos accidentales)'
+        description: 'Escribir CONFIRMAR para proceder'
         required: true
         type: string
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   importar:
@@ -43,9 +34,6 @@ jobs:
       - name: 📥 Descargar BD desde Release
         run: |
           echo "📥 Descargando desde Release: ${{ inputs.release_tag }}"
-
-          # Intentar descargar usando la API de GitHub
-          # El asset debe llamarse rosariogarage.db
           gh release download "${{ inputs.release_tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "rosariogarage.db" \
@@ -54,11 +42,8 @@ jobs:
 
           if [ ! -f "rosariogarage.db" ]; then
             echo "❌ No se pudo descargar rosariogarage.db"
-            echo "   Verificar que el Release '${{ inputs.release_tag }}'"
-            echo "   existe y tiene un asset llamado 'rosariogarage.db'"
             exit 1
           fi
-
           echo "✅ Descargado: $(du -h rosariogarage.db | cut -f1)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,11 +51,8 @@ jobs:
       - name: 🔍 Verificar integridad de la BD
         run: |
           echo "📊 Verificando BD descargada..."
-
-          # Verificar que es un SQLite válido
           sqlite3 rosariogarage.db "PRAGMA integrity_check;" | head -5
 
-          # Estadísticas básicas
           TOTAL=$(sqlite3 rosariogarage.db \
             "SELECT COUNT(*) FROM vehicles;" 2>/dev/null || echo "ERROR")
           ACTIVOS=$(sqlite3 rosariogarage.db \
@@ -79,8 +61,6 @@ jobs:
           HISTORY=$(sqlite3 rosariogarage.db \
             "SELECT COUNT(*) FROM price_history;" \
             2>/dev/null || echo "ERROR")
-
-          # sold_vehicles (puede no existir en BDs antiguas)
           SOLD=$(sqlite3 rosariogarage.db \
             "SELECT COUNT(*) FROM sold_vehicles;" \
             2>/dev/null || echo "tabla no existe aún")
@@ -102,7 +82,6 @@ jobs:
 
           if [ "$ACTIVOS" = "0" ] || [ "$ACTIVOS" = "ERROR" ]; then
             echo "⚠️  ADVERTENCIA: La BD no tiene vehículos activos"
-            echo "   ¿Es correcta la BD que estás importando?"
           fi
 
       - name: 📤 Subir como artifact master-db
@@ -110,8 +89,15 @@ jobs:
         with:
           name: rosariogarage-master-db
           path: rosariogarage.db
-          # 30 días — consistente con scrape.yml
-          retention-days: 30
+          # ──────────────────────────────────────────────────────
+          # CRÍTICO: debe ser 90 días — igual que scrape.yml.
+          # Con 30 días el artifact expira antes de que scrape.yml
+          # lo encuentre si hay un gap de más de 30 días, y además
+          # dawidd6 busca por workflow — el próximo paso manual
+          # es disparar scrape.yml inmediatamente después de este
+          # import para que el ciclo quede sano (ver README).
+          # ──────────────────────────────────────────────────────
+          retention-days: 90
           compression-level: 9
           if-no-files-found: error
 
@@ -120,7 +106,7 @@ jobs:
         with:
           name: rosariogarage-db
           path: rosariogarage.db
-          retention-days: 30
+          retention-days: 90
           compression-level: 9
           if-no-files-found: error
 
@@ -142,14 +128,22 @@ jobs:
       - name: 📝 Resumen
         if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           # 📥 Importación Manual Completada
 
-          | Campo | Valor |
-          |-------|-------|
-          | Release origen | \`${{ inputs.release_tag }}\` |
-          | Artifact generado | \`rosariogarage-master-db\` |
-          | Retención | 30 días |
+          | Campo             | Valor                          |
+          |-------------------|--------------------------------|
+          | Release origen    | `${{ inputs.release_tag }}`    |
+          | Artifact generado | `rosariogarage-master-db`      |
+          | Retención         | 90 días                        |
 
-          El próximo run del scraping diario usará esta BD como base.
+          ## ⚠️ Paso siguiente OBLIGATORIO
+
+          **Disparar `scrape.yml` manualmente ahora** (Actions → 🚗 RosarioGarage Scraper → Run workflow).
+
+          Esto es necesario porque `dawidd6/action-download-artifact` en `scrape.yml`
+          busca artifacts subidos **por `scrape.yml`**, no por este workflow.
+          El scraping manual hace que `scrape.yml` descargue esta BD, la consolide,
+          y la vuelva a subir desde su propio contexto — dejando el ciclo sano
+          para los próximos runs automáticos.
           EOF
