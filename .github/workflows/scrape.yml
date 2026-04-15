@@ -69,7 +69,7 @@ jobs:
             echo ""
             echo "📊 Estadísticas:"
             sqlite3 "$DB_FILE" \
-              "SELECT COUNT(*) as 'Vehículos en worker ${{ matrix.worker_id }}:' FROM vehicles;" \
+              "SELECT COUNT(*) as 'Vehículos:' FROM vehicles;" \
               2>/dev/null || echo "⚠️ Sin datos"
             sqlite3 "$DB_FILE" \
               "SELECT key, value FROM scrape_metadata;" \
@@ -115,55 +115,25 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 📥 Buscar BD maestra en scrape.yml
-        id: download-from-scrape
+      - name: 📥 Descargar BD maestra anterior
+        id: download-master
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
           name: rosariogarage-master-db
-          workflow: scrape.yml
-          workflow_conclusion: success
-          if_no_artifact_found: ignore
-          search_artifacts: true
-          allow_forks: false
-
-      - name: 📥 Buscar BD maestra en Importar_BD.yml (fallback)
-        # ──────────────────────────────────────────────────────
-        # SOLUCIÓN AL BUG: dawidd6 filtra por workflow.
-        # Si import-db.yml fue el último en subir el artifact,
-        # el paso anterior no lo encuentra. Este paso lo busca
-        # en el workflow de importación como fallback.
-        # Solo se ejecuta si el paso anterior no encontró nada.
-        # ──────────────────────────────────────────────────────
-        id: download-from-import
-        if: steps.download-from-scrape.outcome == 'failure' || steps.download-from-scrape.outcome == 'skipped'
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: rosariogarage-master-db
-          workflow: Importar_BD.yml
-          workflow_conclusion: success
+          # ──────────────────────────────────────────────────
+          # SIN workflow: — busca el artifact más reciente
+          # con ese nombre en CUALQUIER workflow del repo.
+          # Esto permite que import-db.yml y scrape.yml
+          # compartan el mismo artifact sin conflicto.
+          # ──────────────────────────────────────────────────
           if_no_artifact_found: ignore
           search_artifacts: true
           allow_forks: false
 
       - name: 📋 Verificar BD maestra anterior
         run: |
-          if [ -f "rosariogarage.db" ]; then
-            echo "✅ BD maestra anterior encontrada"
-            ls -lh rosariogarage.db
-
-            TOTAL=$(sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) FROM vehicles;" 2>/dev/null || echo "?")
-            ACTIVOS=$(sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) FROM vehicles WHERE activo=1;" 2>/dev/null || echo "?")
-            SOLD=$(sqlite3 rosariogarage.db \
-              "SELECT COUNT(*) FROM sold_vehicles;" 2>/dev/null || echo "tabla no existe aún")
-
-            echo "   Total:         $TOTAL vehículos"
-            echo "   Activos:       $ACTIVOS"
-            echo "   Sold vehicles: $SOLD"
-          else
+          if [ ! -f "rosariogarage.db" ]; then
             echo "⚠️  ════════════════════════════════════════════"
             echo "⚠️  NO SE ENCONTRÓ BD MAESTRA ANTERIOR"
             echo "⚠️  Si es la primera ejecución → normal"
@@ -173,7 +143,23 @@ jobs:
             echo "⚠️    3. Luego disparar scrape.yml manualmente"
             echo "⚠️  ════════════════════════════════════════════"
             echo "MASTER_DB_MISSING=true" >> $GITHUB_ENV
+            exit 0
           fi
+
+          TOTAL=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM vehicles;" 2>/dev/null || echo "0")
+          ACTIVOS=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM vehicles WHERE activo=1;" 2>/dev/null || echo "0")
+          SOLD=$(sqlite3 rosariogarage.db \
+            "SELECT COUNT(*) FROM sold_vehicles;" 2>/dev/null || echo "tabla no existe aún")
+          SIZE_MB=$(du -m rosariogarage.db | cut -f1)
+
+          echo "✅ BD maestra anterior encontrada"
+          ls -lh rosariogarage.db
+          echo "   Total:         $TOTAL vehículos"
+          echo "   Activos:       $ACTIVOS"
+          echo "   Sold vehicles: $SOLD"
+          echo "   Tamaño:        ${SIZE_MB}M"
 
       - name: 📁 Crear directorio para workers
         run: mkdir -p ./worker_downloads
@@ -279,7 +265,7 @@ jobs:
               total_historico = 0
               try:
                   archivados_hoy = conn.execute(
-                      "SELECT COUNT(*) FROM sold_vehicles WHERE ultima_vista = ?",
+                      "SELECT COUNT(*) FROM sold_vehicles WHERE fecha_archivo = ?",
                       (today,)
                   ).fetchone()[0]
                   total_historico = conn.execute(
@@ -366,10 +352,10 @@ jobs:
         if: always()
         run: |
           if [ -f "summary.json" ]; then
-            ACTIVOS=$(jq -r '.activos         // "?"' summary.json)
-            NUEVOS=$(jq -r '.nuevos_hoy       // "?"' summary.json)
-            NORMALIZADOS=$(jq -r '.normalizados // "?"' summary.json)
-            PARCIALES=$(jq -r '.parciales     // "?"' summary.json)
+            ACTIVOS=$(jq -r '.activos          // "?"' summary.json)
+            NUEVOS=$(jq -r '.nuevos_hoy        // "?"' summary.json)
+            NORMALIZADOS=$(jq -r '.normalizados  // "?"' summary.json)
+            PARCIALES=$(jq -r '.parciales      // "?"' summary.json)
             ARCHIVADOS=$(jq -r '.archivados_hoy // "?"' summary.json)
             HISTORICO=$(jq -r '.total_historico // "?"' summary.json)
           else
@@ -379,7 +365,7 @@ jobs:
 
           ALERTA=""
           if [ "${MASTER_DB_MISSING:-false}" = "true" ]; then
-            ALERTA="> ⚠️ **BD maestra no encontrada — se creó desde cero**"
+            ALERTA="> ⚠️ **BD maestra no encontrada — BD creada desde cero**"
           fi
 
           cat >> $GITHUB_STEP_SUMMARY << EOF
