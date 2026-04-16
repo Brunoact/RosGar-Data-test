@@ -1069,8 +1069,8 @@ async def fetch_vehicle_details(
                     and not version_raw.strip()
                 ):
                     result['version'] = None
-                if result['norm_status'] == 'full_match':
-                    result['norm_status'] = 'partial_match'
+               # if result['norm_status'] == 'full_match':
+                    #result['norm_status'] = 'partial_match'
 
                 if DEBUG_MODE:
                     if norm.get('warnings'):
