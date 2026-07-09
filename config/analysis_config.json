@@ -3,7 +3,7 @@
     "min_price_usd": 1000,
     "max_price_usd": 500000,
     "min_year": 1930,
-    "max_year": 2025,
+    "max_year": 2030,
     "min_samples_for_stats": 3,
     "exclude_zero_km": false
   },
